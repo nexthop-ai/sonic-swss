@@ -1,0 +1,59 @@
+ARG DEBIAN_VERSION=bookworm
+FROM debian:${DEBIAN_VERSION}
+
+# Install system packages
+RUN apt-get update && apt-get install -y \
+    # Core utilities
+    python3 \
+    python3-pip \
+    # Network tools
+    net-tools \
+    iproute2 \
+    ethtool \
+    bridge-utils \
+    vlan \
+    util-linux \
+    # Libraries
+    libhiredis0.14 \
+    libnl-nf-3-200 \
+    libnl-cli-3-200 \
+    # Other utilities
+    kmod \
+    coreutils \
+    gawk \
+    grep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages
+RUN pip3 install --break-system-packages \
+    docker \
+    pytest \
+    flaky \
+    redis \
+    distro
+
+# Set working directory
+WORKDIR /workspace/tests
+
+# Default command: check prerequisites and run tests
+CMD ["bash", "-c", "\
+    echo '=== Checking prerequisites ===' && \
+    if ! lsmod | grep -q team; then \
+        echo 'ERROR: team kernel module is not loaded!' && \
+        echo 'Please run: sudo modprobe team' && \
+        exit 1; \
+    fi && \
+    echo '✓ team module is loaded' && \
+    echo '=== Installing swsscommon from /debs ===' && \
+    if [ -d /debs ]; then \
+        dpkg -i /debs/libswsscommon_*.deb /debs/python3-swsscommon_*.deb 2>/dev/null || true && \
+        apt-get install -f -y; \
+    else \
+        echo 'WARNING: /debs directory not found, skipping swsscommon installation'; \
+    fi && \
+    echo '=== Waiting for containers to be ready ===' && \
+    sleep 5 && \
+    echo '=== Running tests ===' && \
+    pytest -v --dvsname=sonic-vs \
+"]
+

@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  sw:
+    image: debian:bookworm
+    privileged: true
+    container_name: sonic-test-sw
+    command: sleep infinity
+    stdin_open: true
+    
+  sonic-vs:
+    image: docker-sonic-vs:latest
+    privileged: true
+    container_name: sonic-vs
+    depends_on:
+      - sw
+    network_mode: "container:sonic-test-sw"
+    volumes:
+      - redis-socket:/var/run/redis
+    
+  test-runner:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.test-runner
+      args:
+        DEBIAN_VERSION: bookworm
+    image: sonic-swss-test-runner:latest
+    privileged: true
+    network_mode: "host"
+    pid: "host"
+    depends_on:
+      - sw
+      - sonic-vs
+    volumes:
+      - .:/workspace
+      - redis-socket:/var/run/redis
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/netns:/var/run/netns:shared
+      - /var/run:/var/run:shared
+      - ${SONIC_BUILDIMAGE_DEBS}:/debs:ro
+    working_dir: /workspace/tests
+
+volumes:
+  redis-socket:
+
