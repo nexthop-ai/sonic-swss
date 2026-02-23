@@ -1652,6 +1652,7 @@ namespace portsorch_test
         p.m_switch_id = 0x2100000000000000;      // PHY switch ID
         p.m_line_side_id = 0x2100000000000001;   // Line-side port ID
         p.m_system_side_id = 0x2100000000000002; // System-side port ID
+        p.m_admin_state_up = true;
 
         // Update port in PortsOrch (using private access)
         gPortsOrch->m_portList["Ethernet0"] = p;

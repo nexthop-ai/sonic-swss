@@ -5395,6 +5395,20 @@ void PortsOrch::doPortTask(Consumer &consumer)
 
                 if (p.m_line_side_id && !line_serdes_attr.empty())
                 {
+                    if (p.m_admin_state_up)
+                    {
+                            /* Bring port down before applying serdes attribute*/
+                            if (!setPortAdminStatus(p, false))
+                            {
+                                SWSS_LOG_ERROR("Failed to set port %s admin status DOWN to set gb line serdes attr", p.m_alias.c_str());
+                                it++;
+                                continue;
+                            }
+
+                            p.m_admin_state_up = false;
+                            m_portList[p.m_alias] = p;
+                    }
+
                     if (setPortSerdesAttribute(p.m_line_side_id, p.m_switch_id, line_serdes_attr))
                     {
                         SWSS_LOG_NOTICE("Successfully set line-side gearbox tunings for port %s", p.m_alias.c_str());
@@ -5409,6 +5423,20 @@ void PortsOrch::doPortTask(Consumer &consumer)
 
                 if (p.m_system_side_id && !system_serdes_attr.empty())
                 {
+                    if (p.m_admin_state_up)
+                    {
+                            /* Bring port down before applying serdes attribute*/
+                            if (!setPortAdminStatus(p, false))
+                            {
+                                SWSS_LOG_ERROR("Failed to set port %s admin status DOWN to set gb system serdes attr", p.m_alias.c_str());
+                                it++;
+                                continue;
+                            }
+
+                            p.m_admin_state_up = false;
+                            m_portList[p.m_alias] = p;
+                    }
+
                     if (setPortSerdesAttribute(p.m_system_side_id, p.m_switch_id, system_serdes_attr))
                     {
                         SWSS_LOG_NOTICE("Successfully set system-side gearbox tunings for port %s", p.m_alias.c_str());
