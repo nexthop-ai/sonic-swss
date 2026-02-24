@@ -141,6 +141,11 @@ namespace portsorch_test
     uint32_t set_pfc_asym_failures;
     sai_redis_link_event_damping_algo_aied_config_t _sai_link_event_damping_config = {0, 0, 0, 0, 0};
 
+    // Admin status failure simulation for gearbox serdes tests
+    bool set_admin_status_fail = false;
+    uint32_t set_admin_status_failures = 0;
+    sai_object_id_t set_admin_status_fail_for_port_id = SAI_NULL_OBJECT_ID;
+
     sai_status_t _ut_stub_sai_set_port_attribute(
         _In_ sai_object_id_t port_id,
         _In_ const sai_attribute_t *attr)
@@ -172,6 +177,15 @@ namespace portsorch_test
 	        _sai_set_admin_state_up_count++;
             } else {
 	        _sai_set_admin_state_down_count++;
+            }
+
+            // Simulate failure for specific port or globally
+            if (set_admin_status_fail ||
+                (set_admin_status_fail_for_port_id != SAI_NULL_OBJECT_ID &&
+                 port_id == set_admin_status_fail_for_port_id))
+            {
+                set_admin_status_failures++;
+                return SAI_STATUS_FAILURE;
             }
         }
         else if (attr[0].id == SAI_PORT_ATTR_PATH_TRACING_INTF)
@@ -342,6 +356,11 @@ namespace portsorch_test
         _sai_remove_port_serdes_calls.clear();
         _sai_create_port_serdes_fail_for_port_id = SAI_NULL_OBJECT_ID;
         _port_to_serdes_map.clear();
+
+        // Reset admin status failure flags
+        set_admin_status_fail = false;
+        set_admin_status_failures = 0;
+        set_admin_status_fail_for_port_id = SAI_NULL_OBJECT_ID;
     }
 
     void _hook_sai_port_api()
@@ -1768,6 +1787,7 @@ namespace portsorch_test
         p.m_switch_id = 0x2100000000000000;
         p.m_line_side_id = 0x2100000000000001;
         p.m_system_side_id = 0x2100000000000002;
+        p.m_admin_state_up = true;
 
         gPortsOrch->m_portList["Ethernet0"] = p;
 
@@ -1844,6 +1864,7 @@ namespace portsorch_test
         p.m_switch_id = 0x2100000000000000;
         p.m_line_side_id = 0x2100000000000001;
         p.m_system_side_id = 0x2100000000000002;
+        p.m_admin_state_up = true;
 
         gPortsOrch->m_portList["Ethernet0"] = p;
 
@@ -1941,6 +1962,176 @@ namespace portsorch_test
 
         // Verify no serdes configuration in place (port has no gearbox)
         ASSERT_EQ(_sai_create_port_serdes_calls.size(), 0);
+
+        _unhook_sai_port_api();
+        cleanupPorts(gPortsOrch);
+    }
+
+    /**
+     * Test that verifies error handling when setPortAdminStatus fails
+     * while trying to bring port down before applying gearbox line-side serdes attributes
+     */
+    TEST_F(PortsOrchTest, PortGearboxSerdesAdminStatusDownFailureLineSide)
+    {
+        _reset_serdes_test_state();
+        _hook_sai_port_api();
+
+        auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+        // Get SAI default ports
+        auto &ports = defaultPortList;
+        ASSERT_TRUE(!ports.empty());
+
+        // Generate port config
+        for (const auto &cit : ports)
+        {
+            portTable.set(cit.first, cit.second);
+        }
+
+        // Set PortConfigDone
+        portTable.set("PortConfigDone", { { "count", std::to_string(ports.size()) } });
+
+        // Refill consumer
+        gPortsOrch->addExistingData(&portTable);
+
+        // Apply configuration
+        static_cast<Orch*>(gPortsOrch)->doTask();
+
+        // Get port and mock gearbox initialization
+        Port p;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
+
+        // Mock gearbox port IDs
+        p.m_switch_id = 0x2100000000000000;
+        p.m_line_side_id = 0x2100000000000001;
+        p.m_system_side_id = 0x2100000000000002;
+        p.m_admin_state_up = true;  // Port is UP - this is critical!
+
+        gPortsOrch->m_portList["Ethernet0"] = p;
+
+        // Configure to fail admin status DOWN for this specific port
+        set_admin_status_fail_for_port_id = p.m_port_id;
+
+        // Generate gearbox line-side serdes config
+        std::deque<KeyOpFieldsValuesTuple> kfvList = {{
+            "Ethernet0",
+            SET_COMMAND, {
+                { "gb_line_pre1",  "0x10,0x11,0x12,0x13" },
+                { "gb_line_main",  "0x90,0x91,0x92,0x93" }
+            }
+        }};
+
+        auto consumer = dynamic_cast<Consumer*>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        consumer->addToSync(kfvList);
+
+        uint32_t failure_count_before = set_admin_status_failures;
+        uint32_t admin_down_count_before = _sai_set_admin_state_down_count;
+
+        // Apply configuration - should fail when trying to bring port down
+        static_cast<Orch*>(gPortsOrch)->doTask();
+
+        // Verify admin status DOWN was attempted
+        ASSERT_GT(_sai_set_admin_state_down_count, admin_down_count_before);
+
+        // Verify the SAI call failed
+        ASSERT_EQ(set_admin_status_failures, failure_count_before + 1);
+
+        // Verify NO serdes configuration was attempted (early abort)
+        ASSERT_EQ(_sai_create_port_serdes_calls.size(), 0);
+
+        // Verify task is pending retry
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        ASSERT_FALSE(taskList.empty());
+
+        // Verify port admin state remains UP (not changed)
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
+        ASSERT_TRUE(p.m_admin_state_up);
+
+        _unhook_sai_port_api();
+        cleanupPorts(gPortsOrch);
+    }
+
+    /**
+     * Test that verifies error handling when setPortAdminStatus fails
+     * while trying to bring port down before applying gearbox system-side serdes attributes
+     */
+    TEST_F(PortsOrchTest, PortGearboxSerdesAdminStatusDownFailureSystemSide)
+    {
+        _reset_serdes_test_state();
+        _hook_sai_port_api();
+
+        auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+        // Get SAI default ports
+        auto &ports = defaultPortList;
+        ASSERT_TRUE(!ports.empty());
+
+        // Generate port config
+        for (const auto &cit : ports)
+        {
+            portTable.set(cit.first, cit.second);
+        }
+
+        // Set PortConfigDone
+        portTable.set("PortConfigDone", { { "count", std::to_string(ports.size()) } });
+
+        // Refill consumer
+        gPortsOrch->addExistingData(&portTable);
+
+        // Apply configuration
+        static_cast<Orch*>(gPortsOrch)->doTask();
+
+        // Get port and mock gearbox initialization
+        Port p;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
+
+        // Mock gearbox port IDs
+        p.m_switch_id = 0x2100000000000000;
+        p.m_line_side_id = 0x2100000000000001;
+        p.m_system_side_id = 0x2100000000000002;
+        p.m_admin_state_up = true;  // Port is UP - this is critical!
+
+        gPortsOrch->m_portList["Ethernet0"] = p;
+
+        // Configure to fail admin status DOWN for this specific port
+        set_admin_status_fail_for_port_id = p.m_port_id;
+
+        // Generate gearbox system-side serdes config (no line-side)
+        std::deque<KeyOpFieldsValuesTuple> kfvList = {{
+            "Ethernet0",
+            SET_COMMAND, {
+                { "gb_system_pre1",  "0x15,0x16,0x17,0x18" },
+                { "gb_system_main",  "0x95,0x96,0x97,0x98" }
+            }
+        }};
+
+        auto consumer = dynamic_cast<Consumer*>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+        consumer->addToSync(kfvList);
+
+        uint32_t failure_count_before = set_admin_status_failures;
+        uint32_t admin_down_count_before = _sai_set_admin_state_down_count;
+
+        // Apply configuration - should fail when trying to bring port down
+        static_cast<Orch*>(gPortsOrch)->doTask();
+
+        // Verify admin status DOWN was attempted
+        ASSERT_GT(_sai_set_admin_state_down_count, admin_down_count_before);
+
+        // Verify the SAI call failed
+        ASSERT_EQ(set_admin_status_failures, failure_count_before + 1);
+
+        // Verify NO serdes configuration was attempted (early abort)
+        ASSERT_EQ(_sai_create_port_serdes_calls.size(), 0);
+
+        // Verify task is pending retry
+        std::vector<std::string> taskList;
+        gPortsOrch->dumpPendingTasks(taskList);
+        ASSERT_FALSE(taskList.empty());
+
+        // Verify port admin state remains UP (not changed)
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
+        ASSERT_TRUE(p.m_admin_state_up);
 
         _unhook_sai_port_api();
         cleanupPorts(gPortsOrch);
