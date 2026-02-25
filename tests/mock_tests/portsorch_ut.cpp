@@ -2046,6 +2046,10 @@ namespace portsorch_test
         ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
         ASSERT_TRUE(p.m_admin_state_up);
 
+        // Reset failure flags 
+        set_admin_status_fail = false;
+        set_admin_status_failures = 0;
+
         _unhook_sai_port_api();
         cleanupPorts(gPortsOrch);
     }
@@ -2132,6 +2136,10 @@ namespace portsorch_test
         // Verify port admin state remains UP (not changed)
         ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", p));
         ASSERT_TRUE(p.m_admin_state_up);
+
+        // Reset failure flags 
+        set_admin_status_fail = false;
+        set_admin_status_failures = 0;
 
         _unhook_sai_port_api();
         cleanupPorts(gPortsOrch);
