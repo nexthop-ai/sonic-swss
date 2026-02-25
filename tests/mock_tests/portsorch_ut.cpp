@@ -144,7 +144,6 @@ namespace portsorch_test
     // Admin status failure simulation for gearbox serdes tests
     bool set_admin_status_fail = false;
     uint32_t set_admin_status_failures = 0;
-    sai_object_id_t set_admin_status_fail_for_port_id = SAI_NULL_OBJECT_ID;
 
     sai_status_t _ut_stub_sai_set_port_attribute(
         _In_ sai_object_id_t port_id,
@@ -179,13 +178,11 @@ namespace portsorch_test
 	        _sai_set_admin_state_down_count++;
             }
 
-            // Simulate failure for specific port or globally
-            if (set_admin_status_fail ||
-                (set_admin_status_fail_for_port_id != SAI_NULL_OBJECT_ID &&
-                 port_id == set_admin_status_fail_for_port_id))
+            // Simulate failure
+            if (set_admin_status_fail)
             {
                 set_admin_status_failures++;
-                return SAI_STATUS_FAILURE;
+                return SAI_STATUS_INSUFFICIENT_RESOURCES;
             }
         }
         else if (attr[0].id == SAI_PORT_ATTR_PATH_TRACING_INTF)
@@ -360,7 +357,6 @@ namespace portsorch_test
         // Reset admin status failure flags
         set_admin_status_fail = false;
         set_admin_status_failures = 0;
-        set_admin_status_fail_for_port_id = SAI_NULL_OBJECT_ID;
     }
 
     void _hook_sai_port_api()
@@ -2009,8 +2005,8 @@ namespace portsorch_test
 
         gPortsOrch->m_portList["Ethernet0"] = p;
 
-        // Configure to fail admin status DOWN for this specific port
-        set_admin_status_fail_for_port_id = p.m_port_id;
+        // Set admin status failure
+        set_admin_status_fail = true;
 
         // Generate gearbox line-side serdes config
         std::deque<KeyOpFieldsValuesTuple> kfvList = {{
@@ -2034,6 +2030,8 @@ namespace portsorch_test
         ASSERT_GT(_sai_set_admin_state_down_count, admin_down_count_before);
 
         // Verify the SAI call failed
+        // setPortAdminStatus first tries to set admin status on the main port_id,
+        // which fails, so it returns early before calling setGearboxPortsAttr
         ASSERT_EQ(set_admin_status_failures, failure_count_before + 1);
 
         // Verify NO serdes configuration was attempted (early abort)
@@ -2094,8 +2092,8 @@ namespace portsorch_test
 
         gPortsOrch->m_portList["Ethernet0"] = p;
 
-        // Configure to fail admin status DOWN for this specific port
-        set_admin_status_fail_for_port_id = p.m_port_id;
+        // Set admin status failure
+        set_admin_status_fail = true;
 
         // Generate gearbox system-side serdes config (no line-side)
         std::deque<KeyOpFieldsValuesTuple> kfvList = {{
@@ -2119,6 +2117,8 @@ namespace portsorch_test
         ASSERT_GT(_sai_set_admin_state_down_count, admin_down_count_before);
 
         // Verify the SAI call failed
+        // setPortAdminStatus first tries to set admin status on the main port_id,
+        // which fails, so it returns early before calling setGearboxPortsAttr
         ASSERT_EQ(set_admin_status_failures, failure_count_before + 1);
 
         // Verify NO serdes configuration was attempted (early abort)

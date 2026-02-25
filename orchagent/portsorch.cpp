@@ -561,7 +561,7 @@ static void getPortSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
     }
 }
 
-static void getLinePortSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
+static void getGbPortLineSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
 {
 
     if (port.serdes.gb_line_pre1.is_set)
@@ -601,7 +601,7 @@ static void getLinePortSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &po
 
 }
 
-static void getSystemPortSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
+static void getGbPortSystemSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
 {
 
     if (port.serdes.gb_system_pre1.is_set)
@@ -4716,8 +4716,8 @@ void PortsOrch::doPortTask(Consumer &consumer)
                 PortSerdesAttrMap_t line_serdes_attr;
                 PortSerdesAttrMap_t system_serdes_attr;
                 getPortSerdesAttr(serdes_attr, pCfg);
-                getLinePortSerdesAttr(line_serdes_attr, pCfg);
-                getSystemPortSerdesAttr(system_serdes_attr, pCfg);
+                getGbPortLineSerdesAttr(line_serdes_attr, pCfg);
+                getGbPortSystemSerdesAttr(system_serdes_attr, pCfg);
 
                 // Saved configured admin status
                 bool admin_status = p.m_admin_state_up;
