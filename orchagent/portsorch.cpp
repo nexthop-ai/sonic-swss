@@ -458,187 +458,108 @@ static bool isValidPortTypeForLagMember(const Port& port)
     return (port.m_type == Port::Type::PHY || port.m_type == Port::Type::SYSTEM);
 }
 
-static void getPortSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
+// Generic helper function to extract serdes attributes from any serdes instance
+static void getPortSerdes(PortSerdesAttrMap_t &map, const decltype(PortConfig::serdes) &serdes)
 {
-    if (port.serdes.preemphasis.is_set)
+    if (serdes.preemphasis.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_PREEMPHASIS] = SerdesValue(port.serdes.preemphasis.value);
+        map[SAI_PORT_SERDES_ATTR_PREEMPHASIS] = SerdesValue(serdes.preemphasis.value);
     }
 
-    if (port.serdes.idriver.is_set)
+    if (serdes.idriver.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_IDRIVER] = SerdesValue(port.serdes.idriver.value);
+        map[SAI_PORT_SERDES_ATTR_IDRIVER] = SerdesValue(serdes.idriver.value);
     }
 
-    if (port.serdes.ipredriver.is_set)
+    if (serdes.ipredriver.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_IPREDRIVER] = SerdesValue(port.serdes.ipredriver.value);
+        map[SAI_PORT_SERDES_ATTR_IPREDRIVER] = SerdesValue(serdes.ipredriver.value);
     }
 
-    if (port.serdes.pre1.is_set)
+    if (serdes.pre1.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE1] = SerdesValue(port.serdes.pre1.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE1] = SerdesValue(serdes.pre1.value);
     }
 
-    if (port.serdes.pre2.is_set)
+    if (serdes.pre2.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE2] = SerdesValue(port.serdes.pre2.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE2] = SerdesValue(serdes.pre2.value);
     }
 
-    if (port.serdes.pre3.is_set)
+    if (serdes.pre3.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE3] = SerdesValue(port.serdes.pre3.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE3] = SerdesValue(serdes.pre3.value);
     }
 
-    if (port.serdes.main.is_set)
+    if (serdes.main.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_MAIN] = SerdesValue(port.serdes.main.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_MAIN] = SerdesValue(serdes.main.value);
     }
 
-    if (port.serdes.post1.is_set)
+    if (serdes.post1.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST1] = SerdesValue(port.serdes.post1.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST1] = SerdesValue(serdes.post1.value);
     }
 
-    if (port.serdes.post2.is_set)
+    if (serdes.post2.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST2] = SerdesValue(port.serdes.post2.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST2] = SerdesValue(serdes.post2.value);
     }
 
-    if (port.serdes.post3.is_set)
+    if (serdes.post3.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST3] = SerdesValue(port.serdes.post3.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST3] = SerdesValue(serdes.post3.value);
     }
 
-    if (port.serdes.attn.is_set)
+    if (serdes.attn.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_ATTN] = SerdesValue(port.serdes.attn.value);
+        map[SAI_PORT_SERDES_ATTR_TX_FIR_ATTN] = SerdesValue(serdes.attn.value);
     }
 
-    if (port.serdes.ob_m2lp.is_set)
+    if (serdes.ob_m2lp.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_PAM4_RATIO] = SerdesValue(port.serdes.ob_m2lp.value);
+        map[SAI_PORT_SERDES_ATTR_TX_PAM4_RATIO] = SerdesValue(serdes.ob_m2lp.value);
     }
 
-    if (port.serdes.ob_alev_out.is_set)
+    if (serdes.ob_alev_out.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_OUT_COMMON_MODE] = SerdesValue(port.serdes.ob_alev_out.value);
+        map[SAI_PORT_SERDES_ATTR_TX_OUT_COMMON_MODE] = SerdesValue(serdes.ob_alev_out.value);
     }
 
-    if (port.serdes.obplev.is_set)
+    if (serdes.obplev.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_PMOS_COMMON_MODE] = SerdesValue(port.serdes.obplev.value);
+        map[SAI_PORT_SERDES_ATTR_TX_PMOS_COMMON_MODE] = SerdesValue(serdes.obplev.value);
     }
 
-    if (port.serdes.obnlev.is_set)
+    if (serdes.obnlev.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_NMOS_COMMON_MODE] = SerdesValue(port.serdes.obnlev.value);
+        map[SAI_PORT_SERDES_ATTR_TX_NMOS_COMMON_MODE] = SerdesValue(serdes.obnlev.value);
     }
 
-    if (port.serdes.regn_bfm1p.is_set)
+    if (serdes.regn_bfm1p.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_PMOS_VLTG_REG] = SerdesValue(port.serdes.regn_bfm1p.value);
+        map[SAI_PORT_SERDES_ATTR_TX_PMOS_VLTG_REG] = SerdesValue(serdes.regn_bfm1p.value);
     }
 
-    if (port.serdes.regn_bfm1n.is_set)
+    if (serdes.regn_bfm1n.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_NMOS_VLTG_REG] = SerdesValue(port.serdes.regn_bfm1n.value);
+        map[SAI_PORT_SERDES_ATTR_TX_NMOS_VLTG_REG] = SerdesValue(serdes.regn_bfm1n.value);
     }
 
-    if (port.serdes.custom_collection.is_set)
+    if (serdes.custom_collection.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_CUSTOM_COLLECTION] = SerdesValue(port.serdes.custom_collection.value);
+        map[SAI_PORT_SERDES_ATTR_CUSTOM_COLLECTION] = SerdesValue(serdes.custom_collection.value);
     }
 
-    if (port.serdes.txpolarity.is_set)
+    if (serdes.txpolarity.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_TX_POLARITY] = SerdesValue(port.serdes.txpolarity.value);
+        map[SAI_PORT_SERDES_ATTR_TX_POLARITY] = SerdesValue(serdes.txpolarity.value);
     }
 
-    if (port.serdes.rxpolarity.is_set)
+    if (serdes.rxpolarity.is_set)
     {
-        map[SAI_PORT_SERDES_ATTR_RX_POLARITY] = SerdesValue(port.serdes.rxpolarity.value);
+        map[SAI_PORT_SERDES_ATTR_RX_POLARITY] = SerdesValue(serdes.rxpolarity.value);
     }
-}
-
-static void getGbPortLineSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
-{
-
-    if (port.serdes.gb_line_pre1.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE1] = port.serdes.gb_line_pre1.value;
-    }
-
-    if (port.serdes.gb_line_pre2.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE2] = port.serdes.gb_line_pre2.value;
-    }
-
-    if (port.serdes.gb_line_pre3.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE3] = port.serdes.gb_line_pre3.value;
-    }
-
-    if (port.serdes.gb_line_main.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_MAIN] = port.serdes.gb_line_main.value;
-    }
-
-    if (port.serdes.gb_line_post1.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST1] = port.serdes.gb_line_post1.value;
-    }
-
-    if (port.serdes.gb_line_post2.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST2] = port.serdes.gb_line_post2.value;
-    }
-
-    if (port.serdes.gb_line_post3.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST3] = port.serdes.gb_line_post3.value;
-    }
-
-}
-
-static void getGbPortSystemSerdesAttr(PortSerdesAttrMap_t &map, const PortConfig &port)
-{
-
-    if (port.serdes.gb_system_pre1.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE1] = port.serdes.gb_system_pre1.value;
-    }
-
-    if (port.serdes.gb_system_pre2.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE2] = port.serdes.gb_system_pre2.value;
-    }
-
-    if (port.serdes.gb_system_pre3.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_PRE3] = port.serdes.gb_system_pre3.value;
-    }
-
-    if (port.serdes.gb_system_main.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_MAIN] = port.serdes.gb_system_main.value;
-    }
-
-    if (port.serdes.gb_system_post1.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST1] = port.serdes.gb_system_post1.value;
-    }
-
-    if (port.serdes.gb_system_post2.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST2] = port.serdes.gb_system_post2.value;
-    }
-
-    if (port.serdes.gb_system_post3.is_set)
-    {
-        map[SAI_PORT_SERDES_ATTR_TX_FIR_POST3] = port.serdes.gb_system_post3.value;
-    }
-
 }
 
 static bool isPathTracingSupported()
@@ -4715,9 +4636,9 @@ void PortsOrch::doPortTask(Consumer &consumer)
                 PortSerdesAttrMap_t serdes_attr;
                 PortSerdesAttrMap_t line_serdes_attr;
                 PortSerdesAttrMap_t system_serdes_attr;
-                getPortSerdesAttr(serdes_attr, pCfg);
-                getGbPortLineSerdesAttr(line_serdes_attr, pCfg);
-                getGbPortSystemSerdesAttr(system_serdes_attr, pCfg);
+                getPortSerdes(serdes_attr, pCfg.serdes);
+                getPortSerdes(line_serdes_attr, pCfg.serdes_gb_line);
+                getPortSerdes(system_serdes_attr, pCfg.serdes_gb_system);
 
                 // Saved configured admin status
                 bool admin_status = p.m_admin_state_up;
