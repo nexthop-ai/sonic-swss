@@ -459,7 +459,7 @@ static bool isValidPortTypeForLagMember(const Port& port)
 }
 
 // Generic helper function to extract serdes attributes from any serdes instance
-static void getPortSerdes(PortSerdesAttrMap_t &map, const decltype(PortConfig::serdes) &serdes)
+static void getPortSerdesAttr(PortSerdesAttrMap_t &map, const decltype(PortConfig::serdes) &serdes)
 {
     if (serdes.preemphasis.is_set)
     {
@@ -4636,9 +4636,9 @@ void PortsOrch::doPortTask(Consumer &consumer)
                 PortSerdesAttrMap_t serdes_attr;
                 PortSerdesAttrMap_t line_serdes_attr;
                 PortSerdesAttrMap_t system_serdes_attr;
-                getPortSerdes(serdes_attr, pCfg.serdes);
-                getPortSerdes(line_serdes_attr, pCfg.serdes_gb_line);
-                getPortSerdes(system_serdes_attr, pCfg.serdes_gb_system);
+                getPortSerdesAttr(serdes_attr, pCfg.serdes);
+                getPortSerdesAttr(line_serdes_attr, pCfg.serdes_gb_line);
+                getPortSerdesAttr(system_serdes_attr, pCfg.serdes_gb_system);
 
                 // Saved configured admin status
                 bool admin_status = p.m_admin_state_up;
