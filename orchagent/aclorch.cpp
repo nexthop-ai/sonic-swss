@@ -5522,7 +5522,142 @@ void AclOrch::doAclRuleTask(Consumer &consumer)
         string rule_id = key.substr(found + 1);
         string op = kfvOp(t);
 
+<<<<<<< HEAD
         SWSS_LOG_INFO("OP: %s, TABLE_ID: %s, RULE_ID: %s", op.c_str(), table_id.c_str(), rule_id.c_str());
+=======
+        RuleEntry entry;
+        entry.iter = it;
+        entry.key = key;
+        entry.table_id = table_id;
+        entry.rule_id = rule_id;
+        entry.op = op;
+        entry.tuple = data_ptr;
+        entry.priority = 0;
+
+        // Extract priority based on operation type
+        if (op == SET_COMMAND)
+        {
+            bool invalidPriority = false;
+            // For SET operations, extract priority from field values
+            for (const auto& fv : kfvFieldsValues(*data_ptr))
+            {
+                string attr_name = to_upper(fvField(fv));
+                if (attr_name == "PRIORITY")
+                {
+                    const string &prioStr = fvValue(fv);
+                    try
+                    {
+                        size_t idx = 0;
+                        unsigned long prio = stoul(prioStr, &idx, 10);
+                        if (idx != prioStr.length() || prio > UINT32_MAX)
+                        {
+                            SWSS_LOG_ERROR("Invalid ACL rule priority '%s' for rule %s in table %s",
+                                         prioStr.c_str(), rule_id.c_str(), table_id.c_str());
+                            invalidPriority = true;
+                        }
+                        else
+                        {
+                            entry.priority = static_cast<uint32_t>(prio);
+                        }
+                    }
+                    catch (const std::exception &e)
+                    {
+                        SWSS_LOG_ERROR("Exception parsing ACL rule priority '%s' for rule %s in table %s: %s",
+                                     prioStr.c_str(), rule_id.c_str(), table_id.c_str(), e.what());
+                        invalidPriority = true;
+                    }
+                    break;
+                }
+            }
+            if (invalidPriority)
+            {
+                // Treat invalid priority as invalid entry: log and skip processing this rule
+                it++;
+                continue;
+            }
+            setRules.push_back(entry);
+        }
+        else if (op == DEL_COMMAND)
+        {
+            // Redis DEL operations do not carry field values, only the key is present.
+            // Look up priority from existing in-memory rule map
+            auto existingRule = getAclRule(table_id, rule_id);
+            if (existingRule)
+            {
+                entry.priority = existingRule->getPriority();
+            }
+            delRules.push_back(entry);
+        }
+	else
+	{
+	    SWSS_LOG_ERROR("Unknown operation type %s for ACL rule %s", op.c_str(), key.c_str());
+	    it = consumer.m_toSync.erase(it);
+	    continue;
+	}
+
+        it++;
+    }
+
+    // Optimization: Sort rules by priority to minimize hardware TCAM shifting.
+    // This priority-based sorting is specifically optimized for bulk-update scenarios.
+    // In low-load scenarios with few entries, the shifting overhead is minimal, but in high-scale
+    // updates, this reduces programming time by ensuring rules are sent to SAI in priority order.
+    // Sort SET rules by priority (higher priority value = higher priority, so descending order)
+    sort(setRules.begin(), setRules.end(), [](const RuleEntry& a, const RuleEntry& b) {
+        return a.priority > b.priority;
+    });
+
+    // Sort DEL rules by priority (lower priority values deleted first, so ascending order)
+    sort(delRules.begin(), delRules.end(), [](const RuleEntry& a, const RuleEntry& b) {
+        return a.priority < b.priority;
+    });
+
+    // Note: All DEL operations are processed before SET operations
+    // to facilitate priority-based sorting and ensure correct rule re-programming.
+    // Process DEL rules first (in ascending priority order)
+    for (auto& entry : delRules)
+    {
+        it = entry.iter;
+        string key = entry.key;
+        string table_id = entry.table_id;
+        string rule_id = entry.rule_id;
+        string op = entry.op;
+
+        SWSS_LOG_INFO("OP: %s, TABLE_ID: %s, RULE_ID: %s, PRIORITY: %u (processing DEL in ascending priority order)",
+                      op.c_str(), table_id.c_str(), rule_id.c_str(), entry.priority);
+
+        if (table_id.empty())
+        {
+            SWSS_LOG_WARN("ACL rule with RULE_ID: %s is not valid as TABLE_ID is empty", rule_id.c_str());
+            consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        if (removeAclRule(table_id, rule_id))
+        {
+            removeAclRuleStatus(table_id, rule_id);
+            consumer.m_toSync.erase(it);
+        }
+        else
+        {
+            // Mark pending removal status if removeAclRule returns error
+            setAclRuleStatus(table_id, rule_id, AclObjectStatus::PENDING_REMOVAL);
+        }
+    }
+
+    // Process SET rules in priority order
+    for (auto& entry : setRules)
+    {
+        it = entry.iter;
+        const KeyOpFieldsValuesTuple& t = *(entry.tuple);
+        string key = entry.key;
+        string table_id = entry.table_id;
+        string rule_id = entry.rule_id;
+        string op = entry.op;
+
+        SWSS_LOG_INFO("OP: %s, TABLE_ID: %s, RULE_ID: %s, PRIORITY: %u (processing SET in descending priority order)",
+                      op.c_str(), table_id.c_str(), rule_id.c_str(), entry.priority);
+>>>>>>> 0985c35a (NOS-4156: Handle acl operation with invalid priority (#448))
 
         if (table_id.empty())
         {
