@@ -4061,7 +4061,8 @@ void PortsOrch::registerPort(Port &p)
 
     /* Get Port Serdes Id of this port*/
     sai_object_id_t port_serdes_id = SAI_NULL_OBJECT_ID;
-    if (p.m_type == Port::Type::PHY) {
+    if (p.m_type == Port::Type::PHY &&
+        p.m_role != Port::Role::Rec && p.m_role != Port::Role::Inb) {
         port_serdes_id = getPortSerdesIdFromPortId(p.m_port_id);
     }
 
@@ -4114,6 +4115,7 @@ void PortsOrch::registerPort(Port &p)
     {
         if (!m_supported_phy_serdes_attrs.empty() &&
             p.m_type == Port::Type::PHY &&
+            p.m_role != Port::Role::Rec && p.m_role != Port::Role::Inb &&
             port_serdes_id != SAI_NULL_OBJECT_ID)
         {
             auto supported_attrs = getPortPhySerdesSupportedAttrs(port_serdes_id, p.m_alias.c_str());
@@ -4245,6 +4247,7 @@ void PortsOrch::deInitPort(string alias, sai_object_id_t port_id)
 
     if (!m_supported_phy_serdes_attrs.empty() &&
         p.m_type == Port::Type::PHY &&
+        p.m_role != Port::Role::Rec && p.m_role != Port::Role::Inb &&
         port_serdes_id != SAI_NULL_OBJECT_ID)
     {
         port_phy_serdes_attr_manager.clearCounterIdList(port_serdes_id);
@@ -9306,7 +9309,9 @@ void PortsOrch::generatePortPhySerdesAttrCounterMap()
 
     for (const auto& it: m_portList)
     {
-        if (it.second.m_type == Port::Type::PHY)
+        if (it.second.m_type == Port::Type::PHY &&
+            it.second.m_role != Port::Role::Rec &&
+            it.second.m_role != Port::Role::Inb)
         {
             const char *port_name = it.second.m_alias.c_str();
             sai_object_id_t port_id = it.second.m_port_id;
@@ -9342,7 +9347,9 @@ void PortsOrch::clearPortPhySerdesAttrCounterMap()
     for (const auto& it: m_portList)
     {
         // Clear counter stats only for PHY ports that were previously configured
-        if (it.second.m_type != Port::Type::PHY)
+        if (it.second.m_type != Port::Type::PHY ||
+            it.second.m_role == Port::Role::Rec ||
+            it.second.m_role == Port::Role::Inb)
         {
             continue;
         }
