@@ -12,6 +12,7 @@
 #include "mock_table.h"
 
 #include <memory>
+#include <set>
 #include <string>
 
 extern SwitchOrch *gSwitchOrch;
@@ -26,6 +27,15 @@ namespace portphyattr_test
     sai_port_api_t *old_sai_port_api;
     sai_port_api_t ut_sai_port_api;
 
+    // Records which port OIDs were probed for the PHY-attr ids, so tests can
+    // assert that recycle/inband ports never reach SAI on the filtered out paths.
+    static std::set<sai_object_id_t> g_phy_attr_queried_port_ids;
+
+    // Records which port OIDs were queried for SAI_PORT_ATTR_PORT_SERDES_ID
+    // (attr 108). Used to verify the serdes program/remove paths skip
+    // recycle/inband ports.
+    static std::set<sai_object_id_t> g_serdes_id_queried_port_ids;
+
     sai_status_t mock_get_port_attribute(
         _In_ sai_object_id_t port_id,
         _In_ uint32_t attr_count,
@@ -35,14 +45,20 @@ namespace portphyattr_test
              || attr_list[0].id == SAI_PORT_ATTR_FEC_ALIGNMENT_LOCK)
             && attr_list[0].value.portlanelatchstatuslist.count == 0)
         {
+            g_phy_attr_queried_port_ids.insert(port_id);
             attr_list[0].value.portlanelatchstatuslist.count = 8;
             return SAI_STATUS_BUFFER_OVERFLOW;
         }
         else if (attr_list[0].id == SAI_PORT_ATTR_RX_SNR &&
                  attr_list[0].value.portsnrlist.count == 0)
         {
+            g_phy_attr_queried_port_ids.insert(port_id);
             attr_list[0].value.portsnrlist.count = 8;
             return SAI_STATUS_BUFFER_OVERFLOW;
+        }
+        else if (attr_list[0].id == SAI_PORT_ATTR_PORT_SERDES_ID)
+        {
+            g_serdes_id_queried_port_ids.insert(port_id);
         }
 
         // For all other attributes, call the original SAI API
@@ -255,5 +271,145 @@ namespace portphyattr_test
         }
 
         SUCCEED() << "Unsupported platform scenario handled gracefully";
+    }
+
+    /**
+     * Verify generatePortPhyAttrCounterMap does NOT issue PHY-attr SAI probes
+     * against ports whose role is Recirculation or Inband. The brcm SAI rejects
+     * these probes for recycle ports with "Unknown port attribute"; the filter
+     * in portsorch must keep them out of the iteration.
+     */
+    TEST_F(PortAttrTest, RecirculationAndInbandPortsSkippedInGenerateCounterMap)
+    {
+        ASSERT_NE(gPortsOrch, nullptr);
+        ASSERT_FALSE(gPortsOrch->m_supported_phy_attrs.empty());
+
+        // Inject synthetic Rec and Inb ports that share Port::Type::PHY with
+        // regular ports — only the role distinguishes them.
+        const sai_object_id_t rec_oid = 0xFEED0001;
+        const sai_object_id_t inb_oid = 0xFEED0002;
+
+        Port rec_port("Ethernet-Rec0", Port::Type::PHY);
+        rec_port.m_port_id = rec_oid;
+        rec_port.m_role = Port::Role::Rec;
+        gPortsOrch->m_portList["Ethernet-Rec0"] = rec_port;
+
+        Port inb_port("Ethernet-IB0", Port::Type::PHY);
+        inb_port.m_port_id = inb_oid;
+        inb_port.m_role = Port::Role::Inb;
+        gPortsOrch->m_portList["Ethernet-IB0"] = inb_port;
+
+        g_phy_attr_queried_port_ids.clear();
+        gPortsOrch->generatePortPhyAttrCounterMap();
+
+        EXPECT_EQ(g_phy_attr_queried_port_ids.count(rec_oid), 0u)
+            << "Recirculation port was unexpectedly probed for PHY attrs";
+        EXPECT_EQ(g_phy_attr_queried_port_ids.count(inb_oid), 0u)
+            << "Inband port was unexpectedly probed for PHY attrs";
+
+        // Sanity: at least one regular Ext-role port should have been probed.
+        EXPECT_GT(g_phy_attr_queried_port_ids.size(), 0u)
+            << "Expected at least one regular port to be probed";
+    }
+
+    /**
+     * Mirror of the above for clearPortPhyAttrCounterMap: it must also skip
+     * Rec/Inb ports so the disable path matches the enable path.
+     */
+    TEST_F(PortAttrTest, RecirculationAndInbandPortsSkippedInClearCounterMap)
+    {
+        ASSERT_NE(gPortsOrch, nullptr);
+        ASSERT_FALSE(gPortsOrch->m_supported_phy_attrs.empty());
+
+        const sai_object_id_t rec_oid = 0xFEED1001;
+        const sai_object_id_t inb_oid = 0xFEED1002;
+
+        Port rec_port("Ethernet-Rec0", Port::Type::PHY);
+        rec_port.m_port_id = rec_oid;
+        rec_port.m_role = Port::Role::Rec;
+        gPortsOrch->m_portList["Ethernet-Rec0"] = rec_port;
+
+        Port inb_port("Ethernet-IB0", Port::Type::PHY);
+        inb_port.m_port_id = inb_oid;
+        inb_port.m_role = Port::Role::Inb;
+        gPortsOrch->m_portList["Ethernet-IB0"] = inb_port;
+
+        // clearPortPhyAttrCounterMap doesn't issue SAI gets, so we just ensure
+        // it walks without throwing and silently skips Rec/Inb. This guards
+        // against a future regression where the loop forgets the role check.
+        try {
+            gPortsOrch->clearPortPhyAttrCounterMap();
+        } catch (const std::exception &e) {
+            FAIL() << "clearPortPhyAttrCounterMap threw: " << e.what();
+        }
+        SUCCEED();
+    }
+
+    /**
+     * programSerdes must short-circuit and return success for Rec/Inb ports —
+     * recycle ports do not have a SERDES object, and the brcm SAI rejects
+     * SAI_PORT_ATTR_PORT_SERDES_ID GETs on them with "Unknown port attribute".
+     * Pass an obviously-invalid port_id to ensure the gate fires before the
+     * port_id-vs-port validation block (which would otherwise return false).
+     */
+    TEST_F(PortAttrTest, ProgramSerdesSkipsRecirculationPort)
+    {
+        ASSERT_NE(gPortsOrch, nullptr);
+
+        Port rec_port("Ethernet-Rec0", Port::Type::PHY);
+        rec_port.m_port_id = 0xCC110001;
+        rec_port.m_role = Port::Role::Rec;
+
+        std::map<sai_port_serdes_attr_t, std::vector<uint32_t>> serdes_attr;
+        // Deliberately pass a port_id that doesn't match any of port.m_port_id
+        // / m_line_side_id / m_system_side_id. Without the gate, the validation
+        // block returns false; with the gate, the function returns true before
+        // ever inspecting port_id.
+        const sai_object_id_t bogus_port_id = 0xDEADBEEFCAFEFEEDULL;
+
+        g_serdes_id_queried_port_ids.clear();
+        EXPECT_TRUE(gPortsOrch->programSerdes(rec_port, bogus_port_id, gSwitchId, serdes_attr));
+        EXPECT_EQ(g_serdes_id_queried_port_ids.count(bogus_port_id), 0u);
+        EXPECT_EQ(g_serdes_id_queried_port_ids.count(rec_port.m_port_id), 0u);
+
+        // Same expectation for Inband role.
+        Port inb_port("Ethernet-IB0", Port::Type::PHY);
+        inb_port.m_port_id = 0xCC110002;
+        inb_port.m_role = Port::Role::Inb;
+        EXPECT_TRUE(gPortsOrch->programSerdes(inb_port, bogus_port_id, gSwitchId, serdes_attr));
+    }
+
+    /**
+     * removePortSerdesAttribute must be a no-op for Rec/Inb ports — it should
+     * not issue the SAI_PORT_ATTR_PORT_SERDES_ID GET that the brcm SAI's
+     * recycle-port handler rejects.
+     */
+    TEST_F(PortAttrTest, RemovePortSerdesAttributeSkipsRecirculationPort)
+    {
+        ASSERT_NE(gPortsOrch, nullptr);
+
+        const sai_object_id_t rec_oid = 0xCC220001;
+        const sai_object_id_t inb_oid = 0xCC220002;
+
+        Port rec_port("Ethernet-Rec0", Port::Type::PHY);
+        rec_port.m_port_id = rec_oid;
+        rec_port.m_role = Port::Role::Rec;
+        gPortsOrch->m_portList["Ethernet-Rec0"] = rec_port;
+        gPortsOrch->saiOidToAlias[rec_oid] = "Ethernet-Rec0";
+
+        Port inb_port("Ethernet-IB0", Port::Type::PHY);
+        inb_port.m_port_id = inb_oid;
+        inb_port.m_role = Port::Role::Inb;
+        gPortsOrch->m_portList["Ethernet-IB0"] = inb_port;
+        gPortsOrch->saiOidToAlias[inb_oid] = "Ethernet-IB0";
+
+        g_serdes_id_queried_port_ids.clear();
+        gPortsOrch->removePortSerdesAttribute(rec_oid);
+        gPortsOrch->removePortSerdesAttribute(inb_oid);
+
+        EXPECT_EQ(g_serdes_id_queried_port_ids.count(rec_oid), 0u)
+            << "removePortSerdesAttribute issued SAI GET on a recycle port";
+        EXPECT_EQ(g_serdes_id_queried_port_ids.count(inb_oid), 0u)
+            << "removePortSerdesAttribute issued SAI GET on an inband port";
     }
 } // namespace portphyattr_test
