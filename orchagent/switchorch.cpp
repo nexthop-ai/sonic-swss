@@ -2,6 +2,11 @@
 #include <set>
 #include <inttypes.h>
 #include <iomanip>
+<<<<<<< HEAD
+=======
+#include <sstream>
+#include <regex>
+>>>>>>> dae648cd (NOS-4966: use SAI 15.2 raw temperature attrs for sub-degree NIF precision (#693))
 
 #include "switchorch.h"
 #include "crmorch.h"
@@ -14,6 +19,7 @@
 #include "sai_serialize.h"
 #include "notifications.h"
 #include "redisapi.h"
+#include <experimental/saiswitchextensions.h>
 
 using namespace std;
 using namespace swss;
@@ -1715,22 +1721,32 @@ void SwitchOrch::doTask(SelectableTimer &timer)
             std::vector<int32_t> temp_list(m_numTempSensors);
 
             memset(&attr, 0, sizeof(attr));
-            attr.id = SAI_SWITCH_ATTR_TEMP_LIST;
+            attr.id = SAI_SWITCH_ATTR_EXT_TEMP_LIST_RAW;
             attr.value.s32list.count = m_numTempSensors;
             attr.value.s32list.list = temp_list.data();
 
-            status = sai_switch_api->get_switch_attribute(gSwitchId , 1, &attr);
+            status = sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr);
             if (status == SAI_STATUS_SUCCESS)
             {
-                for (size_t i = 0; i < attr.value.s32list.count ; i++) {
-                    const std::string &fieldName = "temperature_" + std::to_string(i);
-                    values.emplace_back(fieldName, std::to_string(temp_list[i]));
+                double scale = 1.0;
+                int decimals = 0;
+                if (m_tempPrecision < 0)
+                {
+                    for (int8_t e = m_tempPrecision; e < 0; e++)
+                        scale *= 0.1;
+                    decimals = -m_tempPrecision;
                 }
-                m_asicSensorsTable->set("",values);
+                for (size_t i = 0; i < attr.value.s32list.count; i++) {
+                    const std::string &fieldName = "temperature_" + std::to_string(i);
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(decimals) << (temp_list[i] * scale);
+                    values.emplace_back(fieldName, oss.str());
+                }
+                m_asicSensorsTable->set("", values);
             }
             else
             {
-                SWSS_LOG_ERROR("ASIC sensors : failed to get SAI_SWITCH_ATTR_TEMP_LIST: %d", status);
+                SWSS_LOG_ERROR("ASIC sensors : failed to get SAI_SWITCH_ATTR_EXT_TEMP_LIST_RAW: %d", status);
             }
         }
 
@@ -1825,26 +1841,25 @@ void SwitchOrch::initSensorsTable()
 
     if (m_numTempSensors)
     {
-        std::vector<int32_t> temp_list(m_numTempSensors);
-
         memset(&attr, 0, sizeof(attr));
-        attr.id = SAI_SWITCH_ATTR_TEMP_LIST;
-        attr.value.s32list.count = m_numTempSensors;
-        attr.value.s32list.list = temp_list.data();
-
-        status = sai_switch_api->get_switch_attribute(gSwitchId , 1, &attr);
+        attr.id = SAI_SWITCH_ATTR_EXT_TEMP_BASE_TEN_PRECISION;
+        status = sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr);
         if (status == SAI_STATUS_SUCCESS)
         {
-            for (size_t i = 0; i < attr.value.s32list.count ; i++) {
-                const std::string &fieldName = "temperature_" + std::to_string(i);
-                values.emplace_back(fieldName, std::to_string(0));
-            }
-            m_asicSensorsTable->set("",values);
+            m_tempPrecision = attr.value.s8;
+            SWSS_LOG_INFO("ASIC sensors : raw temperature precision exponent = %d (resolution = 10^%d C)",
+                          m_tempPrecision, m_tempPrecision);
         }
         else
         {
-            SWSS_LOG_ERROR("ASIC sensors : failed to get SAI_SWITCH_ATTR_TEMP_LIST: %d", status);
+            SWSS_LOG_ERROR("ASIC sensors : failed to get SAI_SWITCH_ATTR_EXT_TEMP_BASE_TEN_PRECISION: %d", status);
         }
+
+        for (uint8_t i = 0; i < m_numTempSensors; i++) {
+            const std::string &fieldName = "temperature_" + std::to_string(i);
+            values.emplace_back(fieldName, std::to_string(0));
+        }
+        m_asicSensorsTable->set("", values);
     }
 
     if (m_sensorsMaxTempSupported)

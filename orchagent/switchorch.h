@@ -184,6 +184,7 @@ private:
     bool m_numTempSensorsInitialized = false;
     bool m_sensorsMaxTempSupported = true;
     bool m_sensorsAvgTempSupported = true;
+    int8_t m_tempPrecision = 0;
     bool m_vxlanSportUserModeEnabled = false;
     bool m_orderedEcmpEnable = false;
     bool m_PfcDlrInitEnable = false;
