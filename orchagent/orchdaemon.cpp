@@ -984,6 +984,7 @@ void OrchDaemon::start(long heartBeatInterval)
     }
 
     auto tstart = std::chrono::high_resolution_clock::now();
+    auto lastUnhealthyLog = std::chrono::steady_clock::time_point();
 
     while (true)
     {
@@ -1002,6 +1003,23 @@ void OrchDaemon::start(long heartBeatInterval)
         {
             SWSS_LOG_NOTICE("Received signal %d, shutting down orchagent gracefully", gOrchShutdownRequested);
             break;
+        }
+
+        /*
+         * Log an error message periodically if a previous SAI API call failed with
+         * an unrecoverable error. Throttle to at most one message per second:
+         * while events are flowing, select() returns without waiting for
+         * SELECT_TIMEOUT and this loop can iterate thousands of times per second.
+         */
+        std::string saiError;
+        if (getSaiFailureStatus(saiError))
+        {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastUnhealthyLog >= std::chrono::seconds(1))
+            {
+                SWSS_LOG_ERROR("%s", saiError.c_str());
+                lastUnhealthyLog = now;
+            }
         }
 
         auto tend = std::chrono::high_resolution_clock::now();

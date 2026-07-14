@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 
 extern sai_switch_api_t *sai_switch_api;
+extern bool gOrchUnhealthyCached;
 
 namespace saifailure_test
 {
@@ -86,6 +87,29 @@ namespace saifailure_test
         ASSERT_EQ(*_sai_syncd_notifications_count, ++notif_count);
         ASSERT_EQ(*_sai_syncd_notification_event, SAI_REDIS_NOTIFY_SYNCD_INVOKE_DUMP);
 
+        _unhook_sai_switch_api();
+    }
+
+    TEST_F(SaiFailureTest, handleSaiFailureNotExecutedDoesNotLatchUnhealthy)
+    {
+        _hook_sai_switch_api();
+        _sai_syncd_notifications_count = (uint32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_syncd_notification_event = (int32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        *_sai_syncd_notifications_count = 0;
+
+        // NOT_EXECUTED never reached syncd: it must not latch the sticky
+        // unhealthy flag, but still requests a SAI failure dump.
+        gOrchUnhealthyCached = false;
+        handleSaiFailure(SAI_API_ROUTE, "create", SAI_STATUS_NOT_EXECUTED, false);
+        ASSERT_FALSE(gOrchUnhealthyCached);
+        ASSERT_EQ(*_sai_syncd_notifications_count, 1u);
+
+        handleSaiFailure(SAI_API_ROUTE, "create", SAI_STATUS_FAILURE, false);
+        ASSERT_TRUE(gOrchUnhealthyCached);
+
+        gOrchUnhealthyCached = false;
         _unhook_sai_switch_api();
     }
 }

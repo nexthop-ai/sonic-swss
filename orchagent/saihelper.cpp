@@ -842,7 +842,17 @@ void handleSaiFailure(sai_api_t api, string oper, sai_status_t status, bool abor
     string s_status = sai_serialize_status(status);
     string errorString = "Encountered failure in " + oper +
                          " operation, SAI API: " + s_api + ", status: " + s_status;
-    setSaiFailureStatus(true, errorString);
+    /*
+     * SAI_STATUS_NOT_EXECUTED means the operation never reached syncd (e.g. a
+     * bulk flush aborted by client-side metadata validation), so it says
+     * nothing about SAI/ASIC health. Don't latch the unhealthy flag for it:
+     * the flag is only cleared by orchagent restart, and while set, start()
+     * re-logs the error on every select-loop iteration.
+     */
+    if (status != SAI_STATUS_NOT_EXECUTED)
+    {
+        setSaiFailureStatus(true, errorString);
+    }
     SWSS_LOG_ERROR("%s", errorString.c_str());
 
     // Publish a structured syslog event
