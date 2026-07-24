@@ -434,6 +434,86 @@ private:
     void doLagMemberTask(Consumer &consumer);
     void doTransceiverPresenceCheck(Consumer &consumer);
 
+<<<<<<< HEAD
+=======
+    /* RFC 7130 §5 micro-BFD LAG-member forwarding gate.
+     * m_memberBfdUp: member alias -> last micro-BFD state (true=Up); absent
+     * entry means "not micro-monitored" and defaults the BFD term to Up. */
+    std::map<std::string, bool> m_memberBfdUp;
+
+    /*
+     * Independent-LACP make-before-break merge state, cached per LAG member.
+     *
+     * orchagent is LACP-mode-AGNOSTIC: it never branches on independent vs
+     * coupled. Instead it merges two APPL_DB inputs into one idempotent
+     * forwarding decision. A coupled member simply has no LAG_MEMBER_LACP_TABLE
+     * row (collecting_requested stays false / have_lacp_row false), so the merge
+     * collapses to today's behavior. The recompute is done by
+     * applyMemberForwarding():
+     *
+     *   gate         = (bfd_up || not micro-monitored) && macsec_sa_active
+     *   want_ingress = (status_enabled || have_lacp_row) && gate
+     *   want_egress  =  status_enabled                   && gate
+     *
+     * INGRESS uses have_lacp_row (not transient collecting_requested): teamd
+     * self-heals on recovery, so ingress must persist until LACP-row DEL (else RX
+     * blackhole). collecting_requested still drives the confirm row.
+     *
+     * Because want_egress => status_enabled => want_ingress, the invariant
+     * "distribution implies collection" (distribution-only is unsupported on
+     * some ASICs) always holds. The recompute is order-independent, so an event
+     * on either table is a merge, not a clobber.
+     *
+     * status_enabled       <- teamsyncd APP_LAG_MEMBER_TABLE `status` field
+     * have_lacp_row        <- APPL_DB LAG_MEMBER_LACP_TABLE present (from tlm_teamd)
+     * collecting_requested <- APPL_DB LAG_MEMBER_LACP_TABLE (from tlm_teamd)
+     * ingress_on/egress_on <- last SAI bits we issued (for change detection)
+     * confirm_written/confirmed_request_id track the STATE_DB confirm row that
+     * orchagent owns (produced back to tlm_teamd once ingress is programmed). */
+    struct LagMemberLacpState
+    {
+        std::string lag_alias;                  // owning LAG (for the confirm key)
+        bool     status_enabled        = false;
+        bool     collecting_requested  = false;
+        uint64_t collecting_request_id = 0;
+        bool     have_lacp_row         = false;
+
+        bool     applied               = false;
+        bool     ingress_on            = false;
+        bool     egress_on             = false;
+
+        bool     confirm_written       = false;
+        uint64_t confirmed_request_id  = 0;
+        bool     dark_logged           = false;  // watchdog: standing request unsatisfied
+    };
+    // TODO: an LACP row for a port that never joins a LAG leaves a tombstone
+    // entry here (bounded by port count, never iterated); prune on member DEL.
+    std::map<std::string, LagMemberLacpState> m_lagMemberLacp;
+
+    /* Recompute + apply the merged forwarding decision for one member (only
+     * issues SAI on change) and reconcile the STATE_DB confirm row. */
+    bool applyMemberForwarding(const std::string &member_alias);
+    /* Program the collector/distributor to (want_ingress, want_egress) in RFC 7130
+     * phase order, SAI-on-change, committing a cached bit only on success; sets
+     * memberState.applied. Returns false if a needed SAI write failed. */
+    bool programMemberForwarding(Port &port, LagMemberLacpState &memberState, bool want_ingress, bool want_egress);
+    /* Write/clear the STATE_DB confirm row + dark-member watchdog for one member. */
+    void reconcileCollectingConfirm(const std::string &member_alias, LagMemberLacpState &memberState,
+                                    bool want_ingress, bool ingress_ok, bool bfd_ok, bool macsec_ok);
+    /* APPL_DB LAG_MEMBER_LACP_TABLE handler (collecting request from tlm_teamd).
+     * The SET/DEL bodies return true when the task is complete (erase) or false
+     * to retain it (defer/retry). */
+    void doLagMemberLacpTask(Consumer &consumer);
+    bool processLagMemberLacpSet(LagMemberLacpState &memberState, const std::string &lag_alias,
+                                 const std::string &port_alias, const std::string &key,
+                                 const swss::KeyOpFieldsValuesTuple &syncEntry);
+    bool processLagMemberLacpDel(LagMemberLacpState &memberState, const std::string &lag_alias,
+                                 const std::string &port_alias);
+    /* STATE_DB confirm row helpers (key "<lag>|<member>"). */
+    void writeCollectingConfirm(const std::string &lag_alias, const std::string &member_alias, uint64_t request_id);
+    void removeCollectingConfirm(const std::string &lag_alias, const std::string &member_alias);
+
+>>>>>>> a28470aa (NOS-11727: orchagent independent-LACP make-before-break (INGRESS/EGRESS split + confirm) (#817))
     void doTask(NotificationConsumer &consumer);
     void handleNotification(NotificationConsumer &consumer, KeyOpFieldsValuesTuple& entry);
     void doTask(swss::SelectableTimer &timer);
@@ -611,6 +691,14 @@ private:
     void updateSystemPort(Port &port);
     unique_ptr<Table> m_tableVoqSystemLagTable;
     unique_ptr<Table> m_tableVoqSystemLagMemberTable;
+
+    /* STATE_DB LAG_MEMBER_LACP_TABLE confirm table, produced by orchagent and
+     * subscribed by tlm_teamd for independent-LACP make-before-break. */
+    unique_ptr<Table> m_lagMemberLacpConfirmTable;
+    /* APPL_DB LAG_MEMBER_LACP_TABLE (request), read directly by addLagMember so
+     * a member is (re)created with the correct asymmetric collecting-only state
+     * -- e.g. restored collecting-only across a warm reboot. */
+    unique_ptr<Table> m_lagMemberLacpAppTable;
     void voqSyncAddLag(Port &lag);
     void voqSyncDelLag(Port &lag);
     void voqSyncAddLagMember(Port &lag, Port &port, string status);

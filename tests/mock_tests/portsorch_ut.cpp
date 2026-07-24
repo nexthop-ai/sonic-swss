@@ -668,7 +668,8 @@ namespace portsorch_test
                 { APP_VLAN_TABLE_NAME, portsorch_base_pri + 2 },
                 { APP_VLAN_MEMBER_TABLE_NAME, portsorch_base_pri },
                 { APP_LAG_TABLE_NAME, portsorch_base_pri + 4 },
-                { APP_LAG_MEMBER_TABLE_NAME, portsorch_base_pri }
+                { APP_LAG_MEMBER_TABLE_NAME, portsorch_base_pri },
+                { APP_LAG_MEMBER_LACP_TABLE_NAME, portsorch_base_pri }
             };
 
             ASSERT_EQ(gPortsOrch, nullptr);
@@ -4889,6 +4890,913 @@ namespace portsorch_test
     }
 
     /*
+<<<<<<< HEAD
+=======
+    * Verify the MACsec / LAG-member data-plane interaction:
+    *  - setLagMemberState(false) disables collection + distribution on the
+    *    member via SAI and records the MACsec-down intent.
+    *  - A subsequent teamsyncd "enabled" refresh on APP_LAG_MEMBER_TABLE does
+    *    NOT re-enable the member while MACsec is down.
+    *  - setLagMemberState(true) clears the suppression flag and teamsyncd drives
+    *    the SAI re-enable (no direct SAI enable on recovery).
+    */
+    TEST_F(PortsOrchTest, MacsecDownDisablesLagMemberAndSuppressesTeamdReEnable)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable = Table(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lagMemberTable = Table(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { } });
+
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+
+        const std::string memberAlias = ports.begin()->first;
+        const std::string memberKey =
+            std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias;
+        lagMemberTable.set(memberKey, { {"status", "enabled"} });
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        // The member should now exist and have a LAG member id.
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        ASSERT_NE(member.m_lag_member_id, SAI_NULL_OBJECT_ID);
+        ASSERT_TRUE(member.m_macsec_sa_active);
+
+        // Spy on set_lag_member_attribute to capture EGRESS/INGRESS disable values.
+        auto orig_lag_api = sai_lag_api;
+        sai_lag_api = new sai_lag_api_t();
+        memcpy(sai_lag_api, orig_lag_api, sizeof(*sai_lag_api));
+
+        bool egressDisable = false, ingressDisable = false;
+        int setAttrCalls = 0;
+        auto lagSpy = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->set_lag_member_attribute);
+        lagSpy->callFake([&](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                setAttrCalls++;
+                if (attr->id == SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE)
+                    egressDisable = attr->value.booldata;
+                else if (attr->id == SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE)
+                    ingressDisable = attr->value.booldata;
+                return orig_lag_api->set_lag_member_attribute(oid, attr);
+            }
+        );
+
+        // --- MACsec session down: disable the member directly ---
+        gPortsOrch->setLagMemberState(member, false);
+        ASSERT_TRUE(egressDisable);
+        ASSERT_TRUE(ingressDisable);
+
+        Port afterDown;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, afterDown));
+        ASSERT_FALSE(afterDown.m_macsec_sa_active);
+
+        // --- redundant disable (both SCs empty) must be a no-op ---
+        setAttrCalls = 0;
+        gPortsOrch->setLagMemberState(afterDown, false);
+        ASSERT_EQ(setAttrCalls, 0);
+
+        // --- teamsyncd refresh: a status=enabled write must be suppressed ---
+        setAttrCalls = 0;
+        lagMemberTable.set(memberKey, { {"status", "enabled"} });
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        // No SAI re-enable should have happened, and the task should be drained.
+        ASSERT_EQ(setAttrCalls, 0);
+        {
+            vector<string> ts;
+            auto exec = gPortsOrch->getExecutor(APP_LAG_MEMBER_TABLE_NAME);
+            auto consumer = static_cast<Consumer*>(exec);
+            consumer->dumpPendingTasks(ts);
+            ASSERT_TRUE(ts.empty());
+        }
+
+        // --- MACsec session restored: clear suppression, teamsyncd re-enables ---
+        setAttrCalls = 0;
+        gPortsOrch->setLagMemberState(afterDown, true);
+        ASSERT_EQ(setAttrCalls, 0) << "Recovery must not SAI-enable directly";
+
+        Port afterFlagSet;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, afterFlagSet));
+        ASSERT_TRUE(afterFlagSet.m_macsec_sa_active);
+
+        egressDisable = ingressDisable = true;
+        lagMemberTable.set(memberKey, { {"status", "enabled"} });
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        ASSERT_FALSE(egressDisable);
+        ASSERT_FALSE(ingressDisable);
+
+        sai_lag_api = orig_lag_api;
+    }
+
+    /*
+    * RFC 7130 §5 micro-BFD load-balance gate: applyMemberForwarding() computes
+    * effective_forwarding = lacp_enabled && (bfd_up || not-monitored) &&
+    * macsec_sa_active, driving SAI EGRESS_DISABLE (distribution) and
+    * INGRESS_DISABLE (collection). This walks the truth table, including the
+    * MACsec term that keeps a micro-BFD-up event from re-enabling a member
+    * whose MACsec SAs are down.
+    */
+    TEST_F(PortsOrchTest, MicroBfdForwardingGateTruthTable)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable = Table(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lagMemberTable = Table(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { } });
+
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+
+        const std::string memberAlias = ports.begin()->first;
+        const std::string memberKey =
+            std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias;
+        lagMemberTable.set(memberKey, { {"status", "enabled"} });
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        ASSERT_NE(member.m_lag_member_id, SAI_NULL_OBJECT_ID);
+
+        // Spy on set_lag_member_attribute to capture EGRESS/INGRESS disable.
+        auto orig_lag_api = sai_lag_api;
+        sai_lag_api = new sai_lag_api_t();
+        memcpy(sai_lag_api, orig_lag_api, sizeof(*sai_lag_api));
+
+        bool egressDisable = false, ingressDisable = false;
+        auto lagSpy = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->set_lag_member_attribute);
+        lagSpy->callFake([&](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                if (attr->id == SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE)
+                    egressDisable = attr->value.booldata;
+                else if (attr->id == SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE)
+                    ingressDisable = attr->value.booldata;
+                return orig_lag_api->set_lag_member_attribute(oid, attr);
+            }
+        );
+
+        // gate(lacp, bfd_present, bfd_up, macsec) -> expect forwarding on/off.
+        // EGRESS_DISABLE/INGRESS_DISABLE == !forwarding.
+        auto gate = [&](bool lacp, bool bfdPresent, bool bfdUp, bool macsec, bool expectForward)
+        {
+            gPortsOrch->m_lagMemberLacp[memberAlias].status_enabled = lacp;
+            if (bfdPresent)
+                gPortsOrch->m_memberBfdUp[memberAlias] = bfdUp;
+            else
+                gPortsOrch->m_memberBfdUp.erase(memberAlias);
+            gPortsOrch->m_portList[memberAlias].m_macsec_sa_active = macsec;
+
+            egressDisable = ingressDisable = !expectForward;  // seed opposite
+            ASSERT_TRUE(gPortsOrch->applyMemberForwarding(memberAlias));
+            ASSERT_EQ(egressDisable, !expectForward);
+            ASSERT_EQ(ingressDisable, !expectForward);
+        };
+
+        // LACP enabled, MACsec active:
+        gate(true,  true,  true,  true,  true);   // bfd up            -> forward
+        gate(true,  true,  false, true,  false);  // bfd down          -> pulled
+        gate(true,  false, false, true,  true);   // not monitored     -> forward
+        // LACP disabled always pulls regardless of BFD:
+        gate(false, true,  true,  true,  false);
+        gate(false, false, false, true,  false);
+        // MACsec inactive must pull even when LACP + BFD say forward (finding #5):
+        gate(true,  true,  true,  false, false);
+        gate(true,  false, false, false, false);  // not-monitored but MACsec down
+
+        sai_lag_api = orig_lag_api;
+    }
+
+    /*
+    * The PortsOrch BFD observer (update() on SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE)
+    * pulls a member on micro-BFD DOWN, restores it on UP, and on session REMOVED
+    * returns it to plain LACP control while erasing the gate entry (no leak).
+    */
+    TEST_F(PortsOrchTest, MicroBfdObserverDownUpRemoved)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable = Table(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lagMemberTable = Table(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { } });
+
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+
+        const std::string memberAlias = ports.begin()->first;
+        const std::string memberKey =
+            std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias;
+        lagMemberTable.set(memberKey, { {"status", "enabled"} });
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        ASSERT_NE(member.m_lag_member_id, SAI_NULL_OBJECT_ID);
+        gPortsOrch->m_lagMemberLacp[memberAlias].status_enabled = true;
+
+        auto orig_lag_api = sai_lag_api;
+        sai_lag_api = new sai_lag_api_t();
+        memcpy(sai_lag_api, orig_lag_api, sizeof(*sai_lag_api));
+
+        bool egressDisable = false, ingressDisable = false;
+        auto lagSpy = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->set_lag_member_attribute);
+        lagSpy->callFake([&](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                if (attr->id == SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE)
+                    egressDisable = attr->value.booldata;
+                else if (attr->id == SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE)
+                    ingressDisable = attr->value.booldata;
+                return orig_lag_api->set_lag_member_attribute(oid, attr);
+            }
+        );
+
+        // The observer key is a 3-token member-port key vrf<delim>member<delim>peer.
+        const std::string sep(1, state_db_key_delimiter);
+        const std::string peerKey = std::string("default") + sep + memberAlias + sep + "10.0.0.1";
+
+        // micro-BFD DOWN -> member pulled from LB.
+        {
+            BfdUpdate u; u.peer = peerKey; u.state = SAI_BFD_SESSION_STATE_DOWN; u.removed = false;
+            egressDisable = ingressDisable = false;
+            gPortsOrch->update(SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE, &u);
+            ASSERT_TRUE(egressDisable);
+            ASSERT_TRUE(ingressDisable);
+            ASSERT_EQ(gPortsOrch->m_memberBfdUp[memberAlias], false);
+        }
+
+        // micro-BFD UP -> member restored.
+        {
+            BfdUpdate u; u.peer = peerKey; u.state = SAI_BFD_SESSION_STATE_UP; u.removed = false;
+            egressDisable = ingressDisable = true;
+            gPortsOrch->update(SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE, &u);
+            ASSERT_FALSE(egressDisable);
+            ASSERT_FALSE(ingressDisable);
+            ASSERT_EQ(gPortsOrch->m_memberBfdUp[memberAlias], true);
+        }
+
+        // session REMOVED -> gate entry erased, member back under LACP control.
+        {
+            BfdUpdate u; u.peer = peerKey; u.state = SAI_BFD_SESSION_STATE_DOWN; u.removed = true;
+            gPortsOrch->update(SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE, &u);
+            ASSERT_EQ(gPortsOrch->m_memberBfdUp.count(memberAlias), 0U);
+        }
+
+        sai_lag_api = orig_lag_api;
+    }
+
+    /*
+    * A micro-BFD PARENT row on a PortChannel derives one offloaded SAI session
+    * per LAG member (RFC 7130 derived-member model). When a member leaves the
+    * LAG, re-driving the parent tears that member's session down. Uses a fake
+    * sai_bfd_api so create/remove_bfd_session succeed without a real ASIC, and
+    * skips SAI notification registration.
+    */
+    TEST_F(PortsOrchTest, MicroBfdParentDerivesAndTearsDownMembers)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable = Table(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lagMemberTable = Table(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+        Table bfdTable = Table(m_app_db.get(), APP_BFD_SESSION_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+            portTable.set(it.first, it.second);
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { } });
+
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+        auto pit = ports.begin();
+        const std::string m0 = pit->first;
+        ++pit;
+        const std::string m1 = pit->first;
+        const std::string sep = lagMemberTable.getTableNameSeparator();
+        lagMemberTable.set(std::string("PortChannel999") + sep + m0, { {"status", "enabled"} });
+        lagMemberTable.set(std::string("PortChannel999") + sep + m1, { {"status", "enabled"} });
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        Port lag;
+        ASSERT_TRUE(gPortsOrch->getPort("PortChannel999", lag));
+        ASSERT_EQ(lag.m_members.size(), 2U);
+
+        // BfdOrch::doTask routes to software BFD unless a BgpGlobalStateOrch
+        // reports HW offload; force offload on so the parent takes the derived
+        // hardware path. get-or-create (Directory::set throws on a dup type),
+        // and restore the flag afterwards so other tests keep software default.
+        auto *bgpOrch = gDirectory.get<BgpGlobalStateOrch *>();
+        if (!bgpOrch)
+        {
+            bgpOrch = new BgpGlobalStateOrch(m_config_db.get(), CFG_BGP_DEVICE_GLOBAL_TABLE_NAME);
+            gDirectory.set(bgpOrch);
+        }
+        const bool saved_bfd_offload = bgpOrch->bfd_offload;
+        bgpOrch->bfd_offload = true;
+
+        // Fake sai_bfd_api: create returns a fresh OID, remove succeeds.
+        g_microbfd_fake_created = 0;
+        g_microbfd_fake_removed = 0;
+        auto orig_bfd_api = sai_bfd_api;
+        sai_bfd_api = new sai_bfd_api_t();
+        sai_bfd_api->create_bfd_session =
+            [](sai_object_id_t *oid, sai_object_id_t, uint32_t, const sai_attribute_t *) -> sai_status_t {
+                static sai_object_id_t next = 0x11000000;
+                *oid = ++next;
+                g_microbfd_fake_created++;
+                return SAI_STATUS_SUCCESS;
+            };
+        sai_bfd_api->remove_bfd_session =
+            [](sai_object_id_t) -> sai_status_t {
+                g_microbfd_fake_removed++;
+                return SAI_STATUS_SUCCESS;
+            };
+
+        TableConnector stateDbBfdSessionTable(m_state_db.get(), STATE_BFD_SESSION_TABLE_NAME);
+        auto bfdOrch = std::make_unique<BfdOrch>(
+            m_app_db.get(), std::vector<std::string>{APP_BFD_SESSION_TABLE_NAME}, stateDbBfdSessionTable);
+        bfdOrch->register_state_change_notif = true;  // skip SAI notification registration
+
+        const std::string parentKey = "default:PortChannel999:10.0.0.1";
+        bfdTable.set(parentKey, {
+            {"local_addr", "10.0.0.2"}, {"dst_mac", "01:00:5e:90:00:01"},
+            {"type", "async_active"}, {"tx_interval", "1000"},
+            {"rx_interval", "1000"}, {"multiplier", "3"}, {"multihop", "false"}
+        });
+        bfdOrch->addExistingData(&bfdTable);
+        static_cast<Orch *>(bfdOrch.get())->doTask();
+
+        // Derived: one offloaded session per LAG member.
+        const std::string mk0 = std::string("default:PortChannel999:") + m0 + ":10.0.0.1";
+        const std::string mk1 = std::string("default:PortChannel999:") + m1 + ":10.0.0.1";
+        EXPECT_EQ(bfdOrch->m_parentMembers[parentKey].size(), 2U);
+        EXPECT_EQ(bfdOrch->bfd_session_map.count(mk0), 1U);
+        EXPECT_EQ(bfdOrch->bfd_session_map.count(mk1), 1U);
+        EXPECT_EQ(g_microbfd_fake_created, 2);
+
+        // Simulate member m1 leaving the LAG: PortsOrch drops it from m_members
+        // on an APP_LAG_MEMBER_TABLE DEL (addExistingData only re-syncs existing
+        // keys, so it cannot express a delete — edit the membership directly).
+        // Re-driving the parent then tears down the departed member's session.
+        gPortsOrch->m_portList["PortChannel999"].m_members.erase(m1);
+
+        bfdOrch->addExistingData(&bfdTable);
+        static_cast<Orch *>(bfdOrch.get())->doTask();
+
+        EXPECT_EQ(bfdOrch->m_parentMembers[parentKey].size(), 1U);
+        EXPECT_EQ(bfdOrch->bfd_session_map.count(mk1), 0U);
+        EXPECT_EQ(bfdOrch->bfd_session_map.count(mk0), 1U);
+        EXPECT_GE(g_microbfd_fake_removed, 1);
+
+        // Cleanup: detach the observer BfdOrch registered on gPortsOrch (a later
+        // test's LAG event would otherwise call into the destroyed BfdOrch), and
+        // restore the SAI BFD api.
+        gPortsOrch->detach(bfdOrch.get());
+        delete sai_bfd_api;
+        sai_bfd_api = orig_bfd_api;
+        bgpOrch->bfd_offload = saved_bfd_offload;
+    }
+
+    /*
+    * setLagMemberState(false) on a non-LAG port must only persist
+    * m_macsec_sa_active and must not flap the host interface or touch SAI LAG
+    * member attributes.
+    */
+    TEST_F(PortsOrchTest, MacsecDownDoesNotFlapNonLagPort)
+    {
+        Table portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { { } });
+
+        gPortsOrch->addExistingData(&portTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        const std::string portAlias = ports.begin()->first;
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(portAlias, port));
+        ASSERT_EQ(port.m_lag_member_id, SAI_NULL_OBJECT_ID);
+        ASSERT_TRUE(port.m_macsec_sa_active);
+
+        auto orig_hostif_api = sai_hostif_api;
+        sai_hostif_api = new sai_hostif_api_t();
+        memcpy(sai_hostif_api, orig_hostif_api, sizeof(*sai_hostif_api));
+
+        auto orig_lag_api = sai_lag_api;
+        sai_lag_api = new sai_lag_api_t();
+        memcpy(sai_lag_api, orig_lag_api, sizeof(*sai_lag_api));
+
+        int hostifOperStatusCalls = 0;
+        int lagMemberAttrCalls = 0;
+        auto hostifSpy = SpyOn<SAI_API_HOSTIF, SAI_OBJECT_TYPE_HOSTIF>(&sai_hostif_api->set_hostif_attribute);
+        hostifSpy->callFake([&](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                if (attr->id == SAI_HOSTIF_ATTR_OPER_STATUS)
+                {
+                    hostifOperStatusCalls++;
+                }
+                return orig_hostif_api->set_hostif_attribute(oid, attr);
+            }
+        );
+
+        auto lagSpy = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->set_lag_member_attribute);
+        lagSpy->callFake([&](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                lagMemberAttrCalls++;
+                return orig_lag_api->set_lag_member_attribute(oid, attr);
+            }
+        );
+
+        gPortsOrch->setLagMemberState(port, false);
+
+        Port afterDown;
+        ASSERT_TRUE(gPortsOrch->getPort(portAlias, afterDown));
+        ASSERT_FALSE(afterDown.m_macsec_sa_active);
+        ASSERT_EQ(hostifOperStatusCalls, 0);
+        ASSERT_EQ(lagMemberAttrCalls, 0);
+
+        sai_hostif_api = orig_hostif_api;
+        sai_lag_api = orig_lag_api;
+    }
+
+    /* -------- Independent-LACP make-before-break (NOS-11727) --------
+     * Cases are grouped into lifecycle "walks" sharing one member and one SAI
+     * spy (via the helpers below) to avoid repeated set-up boilerplate. */
+
+    /* Read the STATE_DB confirm row orchagent produces for a member; returns
+     * false if no row exists. Key is "<lag>|<member>". */
+    static bool lacpGetConfirm(swss::DBConnector *state_db, const std::string &lag,
+                               const std::string &member, std::map<std::string, std::string> &out)
+    {
+        swss::Table confirmTable(state_db, STATE_LAG_MEMBER_LACP_TABLE_NAME);
+        std::vector<swss::FieldValueTuple> fvs;
+        if (!confirmTable.get(lag + "|" + member, fvs))
+        {
+            return false;
+        }
+        out.clear();
+        for (const auto &fv : fvs)
+        {
+            out[fvField(fv)] = fvValue(fv);
+        }
+        return true;
+    }
+
+    /* Bring all ports up, create PortChannel999 and add its first port as a
+     * member with the given teamsyncd `status`. Returns the member alias after
+     * the SAI member has been created. */
+    static std::string lacpSetupMember(swss::DBConnector *app_db, const std::string &status)
+    {
+        Table portTable(app_db, APP_PORT_TABLE_NAME);
+        Table lagTable(app_db, APP_LAG_TABLE_NAME);
+        Table lagMemberTable(app_db, APP_LAG_MEMBER_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { {} });
+
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+
+        const std::string memberAlias = ports.begin()->first;
+        lagMemberTable.set(std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias,
+                           { {"status", status} });
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        return memberAlias;
+    }
+
+    /* Records ingress/egress LAG-member writes; optionally injects a
+     * collector-enable failure via `ingressEnableStatus`. */
+    struct LacpLagSpy
+    {
+        sai_lag_api_t *orig = nullptr;
+        int calls = 0;
+        bool lastIngressDisable = true;
+        bool lastEgressDisable = true;
+        std::vector<std::pair<bool, bool>> writes;              // {isIngress, disableValue}, ordered
+        sai_status_t ingressEnableStatus = SAI_STATUS_SUCCESS;  // != SUCCESS -> collector-enable fails
+        sai_status_t ingressDisableStatus = SAI_STATUS_SUCCESS; // != SUCCESS -> collector-disable fails
+    };
+
+    // Install a set_lag_member_attribute spy recording writes into `s`; keep the
+    // returned handle alive for the test, and restore `sai_lag_api = s.orig` after.
+    static auto lacpInstallLagSpy(LacpLagSpy &s)
+    {
+        s.orig = sai_lag_api;
+        sai_lag_api = new sai_lag_api_t();
+        memcpy(sai_lag_api, s.orig, sizeof(*sai_lag_api));
+        auto spy = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->set_lag_member_attribute);
+        spy->callFake([&s](sai_object_id_t oid, const sai_attribute_t *attr) -> sai_status_t
+            {
+                if (attr->id == SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE)
+                {
+                    sai_status_t inj = attr->value.booldata ? s.ingressDisableStatus : s.ingressEnableStatus;
+                    if (inj != SAI_STATUS_SUCCESS)
+                        return inj;  // collector enable/disable fails (retry-worthy)
+                    s.calls++;
+                    s.lastIngressDisable = attr->value.booldata;
+                    s.writes.push_back({true, attr->value.booldata});
+                }
+                else if (attr->id == SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE)
+                {
+                    s.calls++;
+                    s.lastEgressDisable = attr->value.booldata;
+                    s.writes.push_back({false, attr->value.booldata});
+                }
+                return s.orig->set_lag_member_attribute(oid, attr);
+            }
+        );
+        return spy;
+    }
+
+    /*
+    * Independent collecting window and the confirm feedback loop on one member:
+    * a coupled member (no LACP row) never gets a confirm row; a collecting
+    * request drives ingress on / egress off and writes the confirm echoing the
+    * epoch; the epoch is followed on bump; an identical republish is a no-op;
+    * status=enabled adds egress; collecting_requested=false withdraws the confirm
+    * but ingress persists (removed only on LACP-row DEL / member removal).
+    * (Coupled ingress==egress movement and micro-BFD/MACsec gating are already
+    * covered by test_Portchannel and the MicroBfd / MacsecDown tests.)
+    */
+    /*
+    * Core independent-mode walk: the merge (ingress = status||collecting,
+    * egress = status), make-before-break ordering (collector before distributor
+    * up, distributor before collector down), the confirm row (write/epoch/
+    * delete), an idempotent republish, and coupled members never being confirmed.
+    */
+    TEST_F(PortsOrchTest, LacpCoreMergeConfirmAndOrdering)
+    {
+        const std::string memberAlias = lacpSetupMember(m_app_db.get(), "disabled");
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        ASSERT_NE(member.m_lag_member_id, SAI_NULL_OBJECT_ID);
+
+        Table lagMemberTable(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+        const std::string mkey = std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias;
+        const std::string lkey = std::string("PortChannel999") + lacpTable.getTableNameSeparator() + memberAlias;
+        std::map<std::string, std::string> confirm;
+
+        LacpLagSpy spy;
+        auto h = lacpInstallLagSpy(spy);
+        auto drive = [&]() {
+            gPortsOrch->addExistingData(&lagMemberTable);
+            gPortsOrch->addExistingData(&lacpTable);
+            static_cast<Orch *>(gPortsOrch)->doTask();
+        };
+
+        // coupled (no LACP row): forwarding on, but never a confirm row
+        lagMemberTable.set(mkey, { {"status", "enabled"} });
+        drive();
+        ASSERT_FALSE(spy.lastIngressDisable);
+        ASSERT_FALSE(spy.lastEgressDisable);
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        lagMemberTable.set(mkey, { {"status", "disabled"} });
+        drive();
+
+        // collecting request -> collector ON only (ingress-before-egress); confirm=7
+        spy.writes.clear();
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "7"} });
+        drive();
+        ASSERT_EQ(spy.writes.size(), 1U);
+        ASSERT_TRUE(spy.writes[0].first);   ASSERT_FALSE(spy.writes[0].second);  // ingress enable only
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "7");
+
+        // distributing (status=enabled) -> distributor ON only, after the collector
+        spy.writes.clear();
+        lagMemberTable.set(mkey, { {"status", "enabled"} });
+        drive();
+        ASSERT_EQ(spy.writes.size(), 1U);
+        ASSERT_FALSE(spy.writes[0].first);  ASSERT_FALSE(spy.writes[0].second);  // egress enable only
+
+        // epoch bump -> confirm follows
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "8"} });
+        drive();
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "8");
+
+        // identical republish -> no SAI write
+        spy.calls = 0;
+        drive();
+        ASSERT_EQ(spy.calls, 0);
+
+        // tear-down: status=disabled -> distributor OFF only (collector stays, request true)
+        spy.writes.clear();
+        lagMemberTable.set(mkey, { {"status", "disabled"} });
+        drive();
+        ASSERT_EQ(spy.writes.size(), 1U);
+        ASSERT_FALSE(spy.writes[0].first);  ASSERT_TRUE(spy.writes[0].second);   // egress disable only
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        // collecting_requested=false (partner outage, row present): ingress PERSISTS
+        // (self-heal safety); only the confirm is withdrawn. No SAI write.
+        spy.writes.clear();
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "false"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "8"} });
+        drive();
+        ASSERT_EQ(spy.writes.size(), 0U);                                        // ingress stays on
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        // recovery (partner returns, epoch bumped): ingress never dropped, so no
+        // RX blackhole; confirm is re-established at the new epoch. No SAI write.
+        spy.writes.clear();
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "9"} });
+        drive();
+        ASSERT_EQ(spy.writes.size(), 0U);                                        // ingress was never torn down
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "9");
+
+        // only an LACP-row DEL / member removal actually tears ingress down
+        auto consumer = static_cast<Consumer*>(gPortsOrch->getExecutor(APP_LAG_MEMBER_LACP_TABLE_NAME));
+        spy.writes.clear();
+        consumer->addToSync(std::deque<KeyOpFieldsValuesTuple>{ { lkey, DEL_COMMAND, {} } });
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        ASSERT_EQ(spy.writes.size(), 1U);
+        ASSERT_TRUE(spy.writes[0].first);   ASSERT_TRUE(spy.writes[0].second);   // ingress disabled
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+    * Warm reboot: APPL_DB holds the member (status=disabled) and its standing
+    * collecting request while the cache is empty (fresh process). addLagMember
+    * must recreate the member directly collecting-only (egress disabled, ingress
+    * enabled at create, no follow-up SAI write) and re-establish the confirm.
+    */
+    TEST_F(PortsOrchTest, LacpWarmRebootRestoresCollectingOnly)
+    {
+        Table portTable(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lagMemberTable(m_app_db.get(), APP_LAG_MEMBER_TABLE_NAME);
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { {} });
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+
+        const std::string memberAlias = ports.begin()->first;
+        lagMemberTable.set(std::string("PortChannel999") + lagMemberTable.getTableNameSeparator() + memberAlias,
+                           { {"status", "disabled"} });
+        lacpTable.set(std::string("PortChannel999") + lacpTable.getTableNameSeparator() + memberAlias,
+                      { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "9"} });
+
+        LacpLagSpy spy;
+        auto hset = lacpInstallLagSpy(spy);
+        bool ingressDisableAtCreate = false, egressDisableAtCreate = false;
+        auto hcreate = SpyOn<SAI_API_LAG, SAI_OBJECT_TYPE_LAG_MEMBER>(&sai_lag_api->create_lag_member);
+        hcreate->callFake([&](sai_object_id_t *oid, sai_object_id_t sw, uint32_t cnt, const sai_attribute_t *attrs) -> sai_status_t
+            {
+                for (uint32_t i = 0; i < cnt; i++)
+                {
+                    if (attrs[i].id == SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE) ingressDisableAtCreate = attrs[i].value.booldata;
+                    else if (attrs[i].id == SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE) egressDisableAtCreate = attrs[i].value.booldata;
+                }
+                return spy.orig->create_lag_member(oid, sw, cnt, attrs);
+            }
+        );
+
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        gPortsOrch->addExistingData(&lagMemberTable);
+        gPortsOrch->addExistingData(&lacpTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        ASSERT_NE(member.m_lag_member_id, SAI_NULL_OBJECT_ID);
+        ASSERT_TRUE(egressDisableAtCreate);
+        ASSERT_FALSE(ingressDisableAtCreate);
+        ASSERT_EQ(spy.calls, 0);
+        std::map<std::string, std::string> confirm;
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "9");
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+    * A SAI collector-enable failure must not write the confirm row and must
+    * retry without corrupting the cache; a later success then confirms.
+    */
+    TEST_F(PortsOrchTest, LacpIngressSaiFailureNoConfirmThenRetry)
+    {
+        const std::string memberAlias = lacpSetupMember(m_app_db.get(), "disabled");
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+        const std::string lkey = std::string("PortChannel999") + lacpTable.getTableNameSeparator() + memberAlias;
+        std::map<std::string, std::string> confirm;
+
+        LacpLagSpy spy;
+        auto h = lacpInstallLagSpy(spy);
+
+        // collector-enable fails -> no confirm, task retried
+        spy.ingressEnableStatus = SAI_STATUS_TABLE_FULL;
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "4"} });
+        gPortsOrch->addExistingData(&lacpTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        {
+            vector<string> ts;
+            auto consumer = static_cast<Consumer*>(gPortsOrch->getExecutor(APP_LAG_MEMBER_LACP_TABLE_NAME));
+            consumer->dumpPendingTasks(ts);
+            ASSERT_FALSE(ts.empty());
+        }
+
+        // cache not corrupted: retry with success confirms with the right epoch
+        spy.ingressEnableStatus = SAI_STATUS_SUCCESS;
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "4");
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+    * The LACP table never creates a member (teamsyncd owns lifecycle): a request
+    * for a port that is not a live LAG member is inert (no SAI, no confirm) and
+    * deferred until the member appears.
+    */
+    TEST_F(PortsOrchTest, LacpRequestForNonMemberIsInert)
+    {
+        Table portTable(m_app_db.get(), APP_PORT_TABLE_NAME);
+        Table lagTable(m_app_db.get(), APP_LAG_TABLE_NAME);
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+
+        auto ports = ut_helper::getInitialSaiPorts();
+        for (const auto &it : ports)
+        {
+            portTable.set(it.first, it.second);
+        }
+        portTable.set("PortConfigDone", { { "count", to_string(ports.size()) } });
+        portTable.set("PortInitDone", { {} });
+        lagTable.set("PortChannel999", { {"admin_status", "up"}, {"mtu", "9100"} });
+        gPortsOrch->addExistingData(&portTable);
+        gPortsOrch->addExistingData(&lagTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        const std::string nonMember = ports.begin()->first;
+        LacpLagSpy spy;
+        auto h = lacpInstallLagSpy(spy);
+
+        lacpTable.set(std::string("PortChannel999") + lacpTable.getTableNameSeparator() + nonMember,
+                      { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "5"} });
+        gPortsOrch->addExistingData(&lacpTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        std::map<std::string, std::string> confirm;
+        ASSERT_EQ(spy.calls, 0);
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", nonMember, confirm));
+        {
+            vector<string> ts;
+            auto consumer = static_cast<Consumer*>(gPortsOrch->getExecutor(APP_LAG_MEMBER_LACP_TABLE_NAME));
+            consumer->dumpPendingTasks(ts);
+            ASSERT_FALSE(ts.empty());
+        }
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+    * A DEL of the collecting request (withdrawal) must retry on SAI failure like
+    * the SET path: if the collector-disable fails, the task is kept and re-driven
+    * rather than dropped, so ingress is not left stranded on.
+    */
+    TEST_F(PortsOrchTest, LacpDelSaiFailureRetries)
+    {
+        const std::string memberAlias = lacpSetupMember(m_app_db.get(), "disabled");
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+        const std::string lkey =
+            std::string("PortChannel999") + lacpTable.getTableNameSeparator() + memberAlias;
+        std::map<std::string, std::string> confirm;
+
+        LacpLagSpy spy;
+        auto h = lacpInstallLagSpy(spy);
+
+        // establish the collecting window (ingress on, confirm written)
+        lacpTable.set(lkey, { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "4"} });
+        gPortsOrch->addExistingData(&lacpTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_FALSE(spy.lastIngressDisable);  // collector on
+
+        auto consumer = static_cast<Consumer*>(gPortsOrch->getExecutor(APP_LAG_MEMBER_LACP_TABLE_NAME));
+
+        // DEL the request while the collector-disable SAI call fails
+        spy.ingressDisableStatus = SAI_STATUS_TABLE_FULL;
+        consumer->addToSync(std::deque<KeyOpFieldsValuesTuple>{ { lkey, DEL_COMMAND, {} } });
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        // task retried (not drained), and the collector was not actually disabled
+        {
+            vector<string> ts;
+            consumer->dumpPendingTasks(ts);
+            ASSERT_FALSE(ts.empty());
+        }
+        ASSERT_FALSE(spy.lastIngressDisable);  // disable failed -> still on
+        // confirm is dropped up front (safe order), before the disable lands
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        // clear the failure and re-drive: collector disabled, task drained
+        spy.ingressDisableStatus = SAI_STATUS_SUCCESS;
+        static_cast<Orch *>(gPortsOrch)->doTask();
+        ASSERT_TRUE(spy.lastIngressDisable);
+        {
+            vector<string> ts;
+            consumer->dumpPendingTasks(ts);
+            ASSERT_TRUE(ts.empty());
+        }
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+    * MACsec recovery on an independent collecting-only member must re-enable the
+    * collector itself, not wait for a teamsyncd status=enabled that never comes
+    * (status stays disabled), otherwise ingress stays disabled forever.
+    */
+    TEST_F(PortsOrchTest, LacpMacsecRecoveryReenablesCollectingOnly)
+    {
+        const std::string memberAlias = lacpSetupMember(m_app_db.get(), "disabled");
+        Table lacpTable(m_app_db.get(), APP_LAG_MEMBER_LACP_TABLE_NAME);
+        lacpTable.set(std::string("PortChannel999") + lacpTable.getTableNameSeparator() + memberAlias,
+                      { {LACP_FIELD_COLLECTING_REQUESTED, "true"}, {LACP_FIELD_COLLECTING_REQUEST_ID, "3"} });
+        gPortsOrch->addExistingData(&lacpTable);
+        static_cast<Orch *>(gPortsOrch)->doTask();
+
+        std::map<std::string, std::string> confirm;
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        LacpLagSpy spy;
+        auto h = lacpInstallLagSpy(spy);
+        Port member;
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+
+        // MACsec down: collector disabled, confirm withdrawn
+        gPortsOrch->setLagMemberState(member, false);
+        ASSERT_TRUE(spy.lastIngressDisable);
+        ASSERT_FALSE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+
+        // MACsec up: no teamsyncd refresh arrives (status stays disabled); orchagent
+        // must recompute on its own -> collector re-enabled, confirm re-established.
+        ASSERT_TRUE(gPortsOrch->getPort(memberAlias, member));
+        gPortsOrch->setLagMemberState(member, true);
+        ASSERT_FALSE(spy.lastIngressDisable);
+        ASSERT_TRUE(lacpGetConfirm(m_state_db.get(), "PortChannel999", memberAlias, confirm));
+        ASSERT_EQ(confirm[LACP_FIELD_COLLECTING_REQUEST_ID], "3");
+
+        sai_lag_api = spy.orig;
+    }
+
+    /*
+>>>>>>> a28470aa (NOS-11727: orchagent independent-LACP make-before-break (INGRESS/EGRESS split + confirm) (#817))
     * The scope of this test is a negative test which verify that:
     * if port operational status is up but operational speed is 0, the port speed should not be
     * updated to DB.

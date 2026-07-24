@@ -799,6 +799,7 @@ PortsOrch::PortsOrch(DBConnector *db, DBConnector *stateDb, vector<table_name_wi
 
     /* Initialize port and vlan table */
     m_portTable = unique_ptr<Table>(new Table(db, APP_PORT_TABLE_NAME));
+    m_lagMemberLacpAppTable = unique_ptr<Table>(new Table(db, APP_LAG_MEMBER_LACP_TABLE_NAME));
     m_sendToIngressPortTable = unique_ptr<Table>(new Table(db, APP_SEND_TO_INGRESS_PORT_TABLE_NAME));
     m_systemPortTable = unique_ptr<Table>(new Table(db, APP_SYSTEM_PORT_TABLE_NAME));
 
@@ -823,6 +824,33 @@ PortsOrch::PortsOrch(DBConnector *db, DBConnector *stateDb, vector<table_name_wi
     /* Initialize counter capability table*/
     m_queueCounterCapabilitiesTable = unique_ptr<Table>(new Table(m_state_db.get(), STATE_QUEUE_COUNTER_CAPABILITIES_NAME));
     m_portCounterCapabilitiesTable = unique_ptr<Table>(new Table(m_state_db.get(), STATE_PORT_COUNTER_CAPABILITIES_NAME));
+
+    /* LACP confirm table (orchagent -> tlm_teamd). */
+    m_lagMemberLacpConfirmTable = unique_ptr<Table>(new Table(m_state_db.get(), STATE_LAG_MEMBER_LACP_TABLE_NAME));
+    {
+        /* On restart the cache is empty: scrub only ORPHANED/stale rows (no/withdrawn
+         * request or epoch mismatch), so live confirms aren't withdrawn on a swss restart. */
+        std::vector<std::string> confirmKeys;
+        m_lagMemberLacpConfirmTable->getKeys(confirmKeys);
+        for (const auto &confirmKey : confirmKeys)
+        {
+            // confirm key "<lag>|<member>" -> APPL_DB request key "<lag>:<member>"
+            size_t sep = confirmKey.find(state_db_key_delimiter);
+            string reqKey = (sep == string::npos) ? confirmKey :
+                confirmKey.substr(0, sep) + m_lagMemberLacpAppTable->getTableNameSeparator() +
+                confirmKey.substr(sep + 1);
+            string requested, reqId, confId;
+            bool valid = m_lagMemberLacpAppTable->hget(reqKey, LACP_FIELD_COLLECTING_REQUESTED, requested)
+                         && requested == LACP_VALUE_TRUE
+                         && m_lagMemberLacpAppTable->hget(reqKey, LACP_FIELD_COLLECTING_REQUEST_ID, reqId)
+                         && m_lagMemberLacpConfirmTable->hget(confirmKey, LACP_FIELD_COLLECTING_REQUEST_ID, confId)
+                         && reqId == confId;
+            if (!valid)
+            {
+                m_lagMemberLacpConfirmTable->del(confirmKey);
+            }
+        }
+    }
 
     initGearbox();
 
@@ -4507,6 +4535,7 @@ bool PortsOrch::bake()
     addExistingData(m_portTable.get());
     addExistingData(APP_LAG_TABLE_NAME);
     addExistingData(APP_LAG_MEMBER_TABLE_NAME);
+    addExistingData(APP_LAG_MEMBER_LACP_TABLE_NAME);
     addExistingData(APP_VLAN_TABLE_NAME);
     addExistingData(APP_VLAN_MEMBER_TABLE_NAME);
     if (saiHwTxSignalSupported && saiTxReadyNotifySupported)
@@ -6396,6 +6425,325 @@ void PortsOrch::doLagTask(Consumer &consumer)
     }
 }
 
+<<<<<<< HEAD
+=======
+void PortsOrch::cascadeLagAdminStatusToMembers(Port &lag, bool bringLagMembersUp)
+{
+    /* This cascades the status of the LAG being up/down to its individual members.
+     * If the LAG is up or down, members are brought up or down accordingly.
+     * Note: Before deleting a LAG, we bring the members up if they were down already.
+    */
+    SWSS_LOG_ENTER();
+
+    for (const auto &memberAlias : lag.m_members)
+    {
+        auto memberIt = m_portList.find(memberAlias);
+        if (memberIt == m_portList.end())
+        {
+            SWSS_LOG_WARN("LAG %s member %s not found in portList",
+                          lag.m_alias.c_str(), memberAlias.c_str());
+            continue;
+        }
+
+        Port &member = memberIt->second;
+
+        if (member.m_type == Port::SYSTEM)
+            continue;
+
+        if (!bringLagMembersUp)
+        {
+            /* LAG going admin-down: flag all members and force them down */
+            member.m_lag_forced_admin_down = true;
+            if (member.m_admin_state_up)
+            {
+                if (!setPortAdminStatus(member, false))
+                {
+                    SWSS_LOG_ERROR("LAG %s: failed to force member %s admin-down",
+                                   lag.m_alias.c_str(), memberAlias.c_str());
+                    member.m_lag_forced_admin_down = false;
+                    continue;
+                }
+                member.m_admin_state_up = false;
+                SWSS_LOG_NOTICE("LAG %s admin-down: forced member %s admin-down",
+                                lag.m_alias.c_str(), memberAlias.c_str());
+            }
+        }
+        else
+        {
+            /* LAG going admin-up: restore member states */
+            if (!member.m_lag_forced_admin_down)
+                continue;
+
+            member.m_lag_forced_admin_down = false;
+
+            /* Read the port's configured admin_status from APP_DB */
+            string cfgAdminStatus;
+            vector<FieldValueTuple> tuples;
+            if (m_portTable->get(memberAlias, tuples))
+            {
+                for (const auto &fv : tuples)
+                {
+                    if (fvField(fv) == "admin_status")
+                    {
+                        cfgAdminStatus = fvValue(fv);
+                        break;
+                    }
+                }
+            }
+
+            bool shouldBeUp = (cfgAdminStatus == "up");
+            if (shouldBeUp && !member.m_admin_state_up)
+            {
+                if (!setPortAdminStatus(member, true))
+                {
+                    SWSS_LOG_ERROR("LAG %s: failed to restore member %s admin-up",
+                                   lag.m_alias.c_str(), memberAlias.c_str());
+                    continue;
+                }
+                member.m_admin_state_up = true;
+                SWSS_LOG_NOTICE("LAG %s admin-up: restored member %s admin-up",
+                                lag.m_alias.c_str(), memberAlias.c_str());
+            }
+            else if (!shouldBeUp)
+            {
+                SWSS_LOG_NOTICE("LAG %s admin-up: member %s stays admin-down (configured down)",
+                                lag.m_alias.c_str(), memberAlias.c_str());
+            }
+        }
+    }
+}
+
+/*
+ * RFC 7130 §5 micro-BFD load-balancer coupling (NOS-7278).
+ *
+ * BfdOrch fires SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE on every BFD state
+ * change; the BfdUpdate.peer is the STATE_DB key "vrf|alias|peer". For a
+ * micro-BFD member session the alias is a PHYSICAL port that is a LAG
+ * member (regular single-hop sessions use alias "default"; static-route
+ * sessions use the routed interface, not a member port). So a session
+ * keyed on a PHY-port-that-is-a-LAG-member is, by construction, a micro
+ * member — we react to those and ignore everything else (mirroring the
+ * key filter NeighOrch uses for the same shared event).
+ */
+void PortsOrch::update(SubjectType type, void *cntx)
+{
+    SWSS_LOG_ENTER();
+
+    if (type != SUBJECT_TYPE_BFD_SESSION_STATE_CHANGE)
+    {
+        return;
+    }
+
+    BfdUpdate *bfd_update = static_cast<BfdUpdate *>(cntx);
+    const std::string &key = bfd_update->peer;
+
+    size_t found_vrf = key.find(state_db_key_delimiter);
+    if (found_vrf == std::string::npos) return;
+    size_t found_ifname = key.find(state_db_key_delimiter, found_vrf + 1);
+    if (found_ifname == std::string::npos) return;
+
+    std::string alias = key.substr(found_vrf + 1, found_ifname - found_vrf - 1);
+    if (alias == "default")
+    {
+        return;  // not a member-bound (micro) session
+    }
+
+    Port port;
+    if (!getPort(alias, port))
+    {
+        /* Port is gone entirely; drop any stale gate entry so it cannot leak
+         * in m_memberBfdUp (nothing left to re-gate). */
+        m_memberBfdUp.erase(alias);
+        return;
+    }
+
+    if (bfd_update->removed)
+    {
+        /* Session deleted: this member is no longer micro-BFD-monitored.
+         * Erase its gate entry so the BFD term in applyMemberForwarding()
+         * falls back to its default ("absent entry" == not-monitored ==
+         * allow), returning the member to plain LACP control. We do NOT
+         * write a restore here — applyMemberForwarding recomputes
+         * forwarding = lacp_enabled && bfd_ok from scratch, so the member
+         * comes back iff LACP still has it selected. Handle this before the
+         * PHY/enslavement filter below: if the member was already
+         * de-enslaved when the removal arrives, we still must erase the entry
+         * (applyMemberForwarding is a no-op on a non-member). */
+        SWSS_LOG_NOTICE("micro-BFD: member %s session removed -> return to LACP control",
+                        alias.c_str());
+        m_memberBfdUp.erase(alias);
+        applyMemberForwarding(alias);
+        return;
+    }
+
+    /* Only a PHY port that is currently a LAG member qualifies as a micro
+     * member. m_lag_member_id != 0 means it is enslaved to a trunk. */
+    if (port.m_type != Port::PHY || port.m_lag_member_id == SAI_NULL_OBJECT_ID)
+    {
+        return;
+    }
+
+    bool up = (bfd_update->state == SAI_BFD_SESSION_STATE_UP);
+    SWSS_LOG_NOTICE("micro-BFD: member %s session %s -> %s LAG load-balancing",
+                    alias.c_str(), up ? "UP" : "DOWN", up ? "restore" : "remove from");
+    m_memberBfdUp[alias] = up;
+    applyMemberForwarding(alias);
+}
+
+/* Merge the LACP/BFD/MACsec gate for one member into (want_ingress, want_egress)
+ * and reconcile the confirm row. See LagMemberLacpState for the formula. */
+bool PortsOrch::applyMemberForwarding(const std::string &member_alias)
+{
+    SWSS_LOG_ENTER();
+
+    Port port;
+    if (!getPort(member_alias, port))
+    {
+        SWSS_LOG_WARN("applyMemberForwarding: member %s not found", member_alias.c_str());
+        return false;
+    }
+    if (port.m_lag_member_id == SAI_NULL_OBJECT_ID)
+    {
+        return true;  // no longer a LAG member; nothing to gate
+    }
+
+    /* Default-constructs a coupled entry if absent; addLagMember seeds it before
+     * any SAI event can reach a live member. */
+    auto &memberState = m_lagMemberLacp[member_alias];
+
+    auto bfd_it  = m_memberBfdUp.find(member_alias);
+    bool bfd_ok  = (bfd_it == m_memberBfdUp.end()) ? true : bfd_it->second;
+    bool macsec_ok = port.m_macsec_sa_active;
+    bool gate = bfd_ok && macsec_ok;
+
+    /* have_lacp_row (not collecting_requested): persist ingress across a partner-
+     * outage self-heal; removed only on LACP-row DEL. See header comment. */
+    bool want_ingress = (memberState.status_enabled || memberState.have_lacp_row) && gate;
+    bool want_egress  = memberState.status_enabled && gate;
+
+    bool apply_ok = programMemberForwarding(port, memberState, want_ingress, want_egress);
+
+    /* The collector reflects the request only if the SAI bit actually matches
+     * what we wanted (a failed program leaves the cached bit unchanged). */
+    bool ingress_ok = (memberState.ingress_on == want_ingress);
+    reconcileCollectingConfirm(member_alias, memberState, want_ingress, ingress_ok, bfd_ok, macsec_ok);
+
+    return apply_ok;
+}
+
+/* Two-phase (RFC 7130 §5): phase 2 gated on phase 1 landing, so a failed SAI
+ * write never leaves egress-without-ingress (apply_ok=false -> caller retries). */
+bool PortsOrch::programMemberForwarding(Port &port, LagMemberLacpState &memberState,
+                                        bool want_ingress, bool want_egress)
+{
+    bool need_ingress = !memberState.applied || memberState.ingress_on != want_ingress;
+    bool need_egress  = !memberState.applied || memberState.egress_on  != want_egress;
+    if (!need_ingress && !need_egress)
+    {
+        return true;
+    }
+
+    bool apply_ok = true;
+    // phase 1: collector-on / distributor-off (never leads egress)
+    if (need_ingress && want_ingress)
+    {
+        if (setCollectionOnLagMember(port, true)) memberState.ingress_on = true;
+        else apply_ok = false;
+    }
+    if (need_egress && !want_egress)
+    {
+        if (setDistributionOnLagMember(port, false)) memberState.egress_on = false;
+        else apply_ok = false;
+    }
+    // phase 2: distribute only once the collector is on; stop collecting only once the distributor is off
+    if (need_egress && want_egress && memberState.ingress_on)
+    {
+        if (setDistributionOnLagMember(port, true)) memberState.egress_on = true;
+        else apply_ok = false;
+    }
+    if (need_ingress && !want_ingress && !memberState.egress_on)
+    {
+        if (setCollectionOnLagMember(port, false)) memberState.ingress_on = false;
+        else apply_ok = false;
+    }
+
+    /* applied=true even if apply_ok=false: a failed bit stays != want_*, so need_*
+     * stays true and retries next call. */
+    memberState.applied = true;
+
+    SWSS_LOG_NOTICE("programMemberForwarding: %s status=%d collecting_req=%d(id=%" PRIu64 ") "
+                    "-> ingress=%s egress=%s (apply_ok=%d)",
+                    port.m_alias.c_str(), memberState.status_enabled, memberState.collecting_requested,
+                    memberState.collecting_request_id, want_ingress ? "on" : "off",
+                    want_egress ? "on" : "off", apply_ok);
+    return apply_ok;
+}
+
+/* Write the confirm row once ingress is programmed for a request (echo epoch),
+ * else clear it; log the dark watchdog once if a request stays unsatisfied. */
+void PortsOrch::reconcileCollectingConfirm(const std::string &member_alias, LagMemberLacpState &memberState,
+                                           bool want_ingress, bool ingress_ok, bool bfd_ok, bool macsec_ok)
+{
+    bool want_confirm = memberState.have_lacp_row && memberState.collecting_requested && want_ingress && ingress_ok;
+    if (want_confirm)
+    {
+        if (!memberState.confirm_written || memberState.confirmed_request_id != memberState.collecting_request_id)
+        {
+            writeCollectingConfirm(memberState.lag_alias, member_alias, memberState.collecting_request_id);
+            memberState.confirm_written = true;
+            memberState.confirmed_request_id = memberState.collecting_request_id;
+        }
+        memberState.dark_logged = false;
+        return;
+    }
+
+    if (memberState.confirm_written)
+    {
+        removeCollectingConfirm(memberState.lag_alias, member_alias);
+        memberState.confirm_written = false;
+        memberState.confirmed_request_id = 0;
+    }
+    /* Watchdog: a standing request we cannot satisfy leaves the member dark
+     * (ingress never programmed). Log once per transition. */
+    bool dark = memberState.have_lacp_row && memberState.collecting_requested;
+    if (dark && !memberState.dark_logged)
+    {
+        SWSS_LOG_WARN("independent LACP: member %s collecting_requested=true (id=%" PRIu64 ") "
+                      "but ingress not confirmed (bfd=%d macsec=%d ingress_sai_ok=%d) -- "
+                      "member stays dark",
+                      member_alias.c_str(), memberState.collecting_request_id,
+                      bfd_ok, macsec_ok, ingress_ok);
+        memberState.dark_logged = true;
+    }
+    else if (!dark)
+    {
+        memberState.dark_logged = false;
+    }
+}
+
+void PortsOrch::writeCollectingConfirm(const std::string &lag_alias,
+                                       const std::string &member_alias,
+                                       uint64_t request_id)
+{
+    std::string key = lag_alias + state_db_key_delimiter + member_alias;
+    std::vector<FieldValueTuple> fvs = {
+        { LACP_FIELD_COLLECTING_CONFIRMED, LACP_VALUE_TRUE },
+        { LACP_FIELD_COLLECTING_REQUEST_ID, std::to_string(request_id) }
+    };
+    m_lagMemberLacpConfirmTable->set(key, fvs);
+    SWSS_LOG_NOTICE("independent LACP: confirmed collecting for %s (request_id=%" PRIu64 ")",
+                    key.c_str(), request_id);
+}
+
+void PortsOrch::removeCollectingConfirm(const std::string &lag_alias,
+                                        const std::string &member_alias)
+{
+    std::string key = lag_alias + state_db_key_delimiter + member_alias;
+    m_lagMemberLacpConfirmTable->del(key);
+    SWSS_LOG_INFO("independent LACP: cleared collecting confirm for %s", key.c_str());
+}
+
+>>>>>>> a28470aa (NOS-11727: orchagent independent-LACP make-before-break (INGRESS/EGRESS split + confirm) (#817))
 void PortsOrch::doLagMemberTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -6516,6 +6864,7 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
                voqSyncAddLagMember(lag, port, status);
             }
 
+<<<<<<< HEAD
             /* Sync an enabled member */
             if (status == "enabled")
             {
@@ -6535,6 +6884,14 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
             }
             /* Sync an disabled member */
             else /* status == "disabled" */
+=======
+            /* Record teamsyncd `status` and funnel through applyMemberForwarding
+             * (the BFD/MACsec gate there is re-applied, so no re-enable race). */
+            auto &memberState = m_lagMemberLacp[port_alias];
+            memberState.lag_alias = lag_alias;
+            memberState.status_enabled = (status == "enabled");
+            if (applyMemberForwarding(port_alias))
+>>>>>>> a28470aa (NOS-11727: orchagent independent-LACP make-before-break (INGRESS/EGRESS split + confirm) (#817))
             {
                 /* disable distribution first, distribution-only mode
                  * is not supported on Mellanox platform
@@ -6580,6 +6937,135 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
             it = consumer.m_toSync.erase(it);
         }
     }
+}
+
+/* APPL_DB LAG_MEMBER_LACP_TABLE handler (collecting request from tlm_teamd,
+ * key "<lag>:<member>"); caches the request and funnels into applyMemberForwarding. */
+void PortsOrch::doLagMemberLacpTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        auto &syncEntry = it->second;
+
+        string key = kfvKey(syncEntry);
+        size_t found = key.find(':');
+        if (found == string::npos)
+        {
+            SWSS_LOG_ERROR("Failed to parse LAG_MEMBER_LACP_TABLE key %s", key.c_str());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+        string lag_alias = key.substr(0, found);
+        string port_alias = key.substr(found + 1);
+        string op = kfvOp(syncEntry);
+
+        auto &memberState = m_lagMemberLacp[port_alias];
+        memberState.lag_alias = lag_alias;
+
+        bool done;
+        if (op == SET_COMMAND)
+        {
+            done = processLagMemberLacpSet(memberState, lag_alias, port_alias, key, syncEntry);
+        }
+        else if (op == DEL_COMMAND)
+        {
+            done = processLagMemberLacpDel(memberState, lag_alias, port_alias);
+        }
+        else
+        {
+            SWSS_LOG_ERROR("Unknown operation type %s", op.c_str());
+            done = true;
+        }
+
+        if (done)
+        {
+            it = consumer.m_toSync.erase(it);
+        }
+        else
+        {
+            it++;   // deferred (member not live) or SAI failure -> retry next doTask()
+        }
+    }
+}
+
+bool PortsOrch::processLagMemberLacpSet(LagMemberLacpState &memberState, const std::string &lag_alias,
+                                        const std::string &port_alias, const std::string &key,
+                                        const swss::KeyOpFieldsValuesTuple &syncEntry)
+{
+    bool requested = false;
+    // Default to the cached epoch so a malformed id doesn't clobber it with 0.
+    uint64_t request_id = memberState.collecting_request_id;
+    for (auto i : kfvFieldsValues(syncEntry))
+    {
+        if (fvField(i) == LACP_FIELD_COLLECTING_REQUESTED)
+        {
+            requested = (fvValue(i) == LACP_VALUE_TRUE);
+        }
+        else if (fvField(i) == LACP_FIELD_COLLECTING_REQUEST_ID)
+        {
+            try
+            {
+                request_id = stoull(fvValue(i));
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("LAG_MEMBER_LACP_TABLE %s: bad collecting_request_id '%s'",
+                               key.c_str(), fvValue(i).c_str());
+            }
+        }
+    }
+
+    /* id 0 is the confirm withdraw sentinel; a requested=true row with id 0 can't
+     * be confirmed, so drop the request and log (visible stall, not silent). */
+    if (requested && request_id == 0)
+    {
+        SWSS_LOG_WARN("LAG_MEMBER_LACP_TABLE %s: collecting_requested=true with request_id 0 "
+                      "(0 is the withdraw sentinel); not confirmable", key.c_str());
+        requested = false;
+    }
+
+    memberState.have_lacp_row = true;
+    memberState.collecting_requested = requested;
+    memberState.collecting_request_id = request_id;
+
+    /* Defer until teamsyncd creates the SAI member; state is cached, so table order doesn't matter. */
+    Port port;
+    if (!getPort(port_alias, port) || port.m_lag_member_id == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_INFO("LAG_MEMBER_LACP_TABLE %s: member not a live LAG member yet, deferring",
+                      key.c_str());
+        return false;   // retain / retry
+    }
+
+    return applyMemberForwarding(port_alias);   // true = done (erase), false = retain (retry)
+}
+
+bool PortsOrch::processLagMemberLacpDel(LagMemberLacpState &memberState, const std::string &lag_alias,
+                                        const std::string &port_alias)
+{
+    /* Withdrawn / mode flip to coupled: clear the request, recompute (ingress falls
+     * back to status, confirm deleted). Never touch the SAI member itself. */
+    memberState.have_lacp_row = false;
+    memberState.collecting_requested = false;
+    memberState.collecting_request_id = 0;
+
+    Port port;
+    if (getPort(port_alias, port) && port.m_lag_member_id != SAI_NULL_OBJECT_ID)
+    {
+        return applyMemberForwarding(port_alias);   // false -> retain (retry on SAI failure)
+    }
+
+    /* No live member: best-effort clear of any confirm row we own. */
+    if (memberState.confirm_written)
+    {
+        removeCollectingConfirm(lag_alias, port_alias);
+        memberState.confirm_written = false;
+        memberState.confirmed_request_id = 0;
+    }
+    return true;   // done (erase)
 }
 
 void PortsOrch::onWarmBootEnd()
@@ -6628,6 +7114,7 @@ void PortsOrch::doTask()
         APP_PORT_TABLE_NAME,
         APP_LAG_TABLE_NAME,
         APP_LAG_MEMBER_TABLE_NAME,
+        APP_LAG_MEMBER_LACP_TABLE_NAME,
         APP_VLAN_TABLE_NAME,
         APP_VLAN_MEMBER_TABLE_NAME
     };
@@ -6635,7 +7122,10 @@ void PortsOrch::doTask()
     for (auto tableName: tableOrder)
     {
         auto consumer = getExecutor(tableName);
-        consumer->drain();
+        if (consumer)   // a table may not be registered (e.g. LAG_MEMBER_LACP absent in some configs/tests)
+        {
+            consumer->drain();
+        }
     }
 
     // drain remaining tables
@@ -6692,6 +7182,10 @@ void PortsOrch::doTask(Consumer &consumer)
         else if (table_name == APP_LAG_MEMBER_TABLE_NAME || table_name == CHASSIS_APP_LAG_MEMBER_TABLE_NAME)
         {
             doLagMemberTask(consumer);
+        }
+        else if (table_name == APP_LAG_MEMBER_LACP_TABLE_NAME)
+        {
+            doLagMemberLacpTask(consumer);
         }
     }
 }
@@ -8332,6 +8826,37 @@ bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
     SWSS_LOG_ENTER();
     bool enableForwarding = (member_status == "enabled");
 
+    /* Honor any persisted collecting request so the member is (re)created in the
+     * correct asymmetric collecting-only state (e.g. across a warm reboot). */
+    bool haveLacpRow = false;
+    bool collectingRequested = false;
+    uint64_t collectingRequestId = 0;
+    auto cachedIt = m_lagMemberLacp.find(port.m_alias);
+    if (cachedIt != m_lagMemberLacp.end() && cachedIt->second.have_lacp_row)
+    {
+        haveLacpRow = true;
+        collectingRequested = cachedIt->second.collecting_requested;
+        collectingRequestId = cachedIt->second.collecting_request_id;
+    }
+    else
+    {
+        string reqKey = lag.m_alias + m_lagMemberLacpAppTable->getTableNameSeparator() + port.m_alias;
+        string val;
+        if (m_lagMemberLacpAppTable->hget(reqKey, LACP_FIELD_COLLECTING_REQUESTED, val))
+        {
+            haveLacpRow = true;  // row exists (independent-mode member), value aside
+            collectingRequested = (val == LACP_VALUE_TRUE);
+            string idVal;
+            if (m_lagMemberLacpAppTable->hget(reqKey, LACP_FIELD_COLLECTING_REQUEST_ID, idVal))
+            {
+                try { collectingRequestId = stoull(idVal); } catch (const std::exception &) {}
+            }
+        }
+    }
+    // Ingress persists for the member's whole independent-mode lifetime (row
+    // present), matching applyMemberForwarding's want_ingress = status || have_lacp_row.
+    bool wantIngress = enableForwarding || haveLacpRow;
+
     sai_uint32_t pvid;
     if (getPortPvid(lag, pvid))
     {
@@ -8349,14 +8874,16 @@ bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
     attr.value.oid = port.m_port_id;
     attrs.push_back(attr);
 
-    if (!enableForwarding && port.m_type != Port::SYSTEM)
+    /* Program both bits explicitly (never rely on the SAI default) so ASIC intent
+     * is unambiguous, incl. the asymmetric collecting-only case (ingress on/egress off). */
+    if (port.m_type != Port::SYSTEM)
     {
         attr.id = SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE;
-        attr.value.booldata = true;
+        attr.value.booldata = !enableForwarding;
         attrs.push_back(attr);
 
         attr.id = SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE;
-        attr.value.booldata = true;
+        attr.value.booldata = !wantIngress;
         attrs.push_back(attr);
     }
 
@@ -8383,6 +8910,31 @@ bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
     lag.m_members.insert(port.m_alias);
 
     m_portList[lag.m_alias] = lag;
+
+    /* Seed the merge cache to the bits just programmed, so the recompute only
+     * issues SAI on a genuine change. */
+    auto &memberState = m_lagMemberLacp[port.m_alias];
+    memberState.lag_alias = lag.m_alias;
+    memberState.status_enabled = enableForwarding;
+    if (haveLacpRow)
+    {
+        memberState.have_lacp_row = true;
+        memberState.collecting_requested = collectingRequested;
+        memberState.collecting_request_id = collectingRequestId;
+    }
+    memberState.applied = true;
+    if (port.m_type == Port::SYSTEM)
+    {
+        /* SYSTEM members are created with SAI defaults (both enabled); seed to that
+         * so change detection issues a disable when status requires it. */
+        memberState.ingress_on = true;
+        memberState.egress_on = true;
+    }
+    else
+    {
+        memberState.ingress_on = wantIngress;
+        memberState.egress_on = enableForwarding;
+    }
 
     if ((lag.m_bridge_port_id > 0)||(!lag.m_child_ports.empty()))
     {
@@ -8431,6 +8983,10 @@ bool PortsOrch::removeLagMember(Port &lag, Port &port)
     m_portList[port.m_alias] = port;
     lag.m_members.erase(port.m_alias);
     m_portList[lag.m_alias] = lag;
+
+    // Remove the collecting confirm row from the STATE_DB as well
+    removeCollectingConfirm(lag.m_alias, port.m_alias);
+    m_lagMemberLacp.erase(port.m_alias);
 
     if ((lag.m_bridge_port_id > 0)||(!lag.m_child_ports.empty()))
     {
@@ -11560,6 +12116,82 @@ void PortsOrch::setMACsecEnabledState(sai_object_id_t port_id, bool enabled)
     {
         setPortMtu(p, p.m_mtu);
     }
+<<<<<<< HEAD
+=======
+
+    /*
+     * When MACsec is enabled on a port, the MACsec hardware will drop traffic
+     * until the SAs are established. Thus, the MACsec data plane is considered
+     * down (false). When MACsec is disabled on the port, the port returns to
+     * normal cleartext forwarding, so the MACsec data plane constraint is lifted (true).
+     */
+    setLagMemberState(p, !enabled);
+}
+
+void PortsOrch::setLagMemberState(Port &port, bool enabled)
+{
+    SWSS_LOG_ENTER();
+
+    /* Nothing to do if the intent is unchanged. Both MACsec SCs going empty on
+     * a session timeout would otherwise drive a redundant disable (and a
+     * duplicate SAI write + log notice) per direction. */
+    if (port.m_macsec_sa_active == enabled)
+    {
+        return;
+    }
+
+    /* Persist the MACsec data-plane intent so that a later teamsyncd refresh
+     * of APP_LAG_MEMBER_TABLE (handled in doLagMemberTask) does not silently
+     * re-enable the member while MACsec is down. Always update this, including
+     * for ports that are not yet (or no longer) LAG members. */
+    port.m_macsec_sa_active = enabled;
+    auto it = m_portList.find(port.m_alias);
+    if (it != m_portList.end())
+    {
+        it->second.m_macsec_sa_active = enabled;
+    }
+
+    const bool is_lag_member = (port.m_lag_member_id != SAI_NULL_OBJECT_ID);
+
+    if (!enabled && is_lag_member)
+    {
+        /* Flap the host interface oper status to force teamd to instantly drop
+         * the LAG member (bypassing the 90s LACP timeout) without permanently
+         * holding carrier down (which would block wpa_supplicant EAPOL). Only
+         * flap LAG members -- doing so on a standalone port would drop routing
+         * adjacencies. */
+        if (port.m_oper_status == SAI_PORT_OPER_STATUS_UP)
+        {
+            SWSS_LOG_NOTICE("Flapping host interface %s to force teamd LACP reset due to MACsec down",
+                            port.m_alias.c_str());
+            setHostIntfsOperStatus(port, false);
+            setHostIntfsOperStatus(port, true);
+        }
+
+        if (!applyMemberForwarding(port.m_alias))
+        {
+            SWSS_LOG_ERROR("Failed to disable collection/distribution on LAG member %s",
+                           port.m_alias.c_str());
+            return;
+        }
+
+        SWSS_LOG_NOTICE("MACsec disabled LAG member %s", port.m_alias.c_str());
+    }
+    else if (enabled && is_lag_member)
+    {
+        // MACsec data plane is up again, recompute now
+        auto lacpIt = m_lagMemberLacp.find(port.m_alias);
+        if (lacpIt != m_lagMemberLacp.end() && lacpIt->second.have_lacp_row)
+        {
+            applyMemberForwarding(port.m_alias);
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("MACsec SA active on %s; awaiting teamsyncd to re-enable LAG member",
+                            port.m_alias.c_str());
+        }
+    }
+>>>>>>> a28470aa (NOS-11727: orchagent independent-LACP make-before-break (INGRESS/EGRESS split + confirm) (#817))
 }
 
 bool PortsOrch::isMACsecPort(sai_object_id_t port_id) const
