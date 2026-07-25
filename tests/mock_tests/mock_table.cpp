@@ -177,8 +177,9 @@ namespace swss
                                  const std::string &op,
                                  const std::string &prefix)
     {
-        auto &table = gDB[m_pipe->getDbId()][getTableName()];
-        table.erase(key);
+        gDB[m_pipe->getDbId()][getTableName()].erase(key);
+        // Real del() also clears the staging table ("_"+table); model that.
+        gDB[m_pipe->getDbId()]["_" + getTableName()].erase(key);
     }
 
     void ProducerStateTable::set(const std::vector<KeyOpFieldsValuesTuple>& values)

@@ -414,4 +414,20 @@ tests_teamsyncd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GT
 tests_teamsyncd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 \
         -lswsscommon -ldl -lhiredis -lgtest -lgtest_main -lpthread -lteam -lteamdctl -lnl-route-3
 
+
+tests_tlm_teamd_SOURCES = tlm_teamd/tlm_teamd_ut.cpp \
+                          $(top_srcdir)/tlm_teamd/lacp_sync.cpp \
+                          $(top_srcdir)/tlm_teamd/teamdctl_mgr.cpp \
+                          $(top_srcdir)/tlm_teamd/values_store.cpp \
+                          mock_dbconnector.cpp \
+                          mock_table.cpp \
+                          mock_hiredis.cpp \
+                          mock_redisreply.cpp
+
+tests_tlm_teamd_INCLUDES = $(tests_INCLUDES) -I$(top_srcdir)/tlm_teamd
+tests_tlm_teamd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI)
+tests_tlm_teamd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI) $(tests_tlm_teamd_INCLUDES)
+tests_tlm_teamd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 \
+        -lswsscommon -ldl -lhiredis -lgtest -lgtest_main -lpthread -lteam -lteamdctl -lnl-route-3 -ljansson
+
 LOG_DRIVER = $(top_srcdir)/run-gtest-suite.py
