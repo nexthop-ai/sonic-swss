@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <teamdctl.h>
 
@@ -21,6 +22,11 @@ public:
     // Retry logic added to prevent incorrect error reporting in dump API's
     TeamdCtlDump get_dump(const std::string & lag_name, bool to_retry);
     TeamdCtlDumps get_dumps(bool to_retry);
+
+    // Write a per-member runner state item back to teamd over teamdctl
+    void set_member_state(const std::string & lag_name, const std::string & member,
+                          const std::string & item, const std::string & value);
+    std::unordered_set<std::string> get_lags() const;
 
 private:
     bool has_key(const std::string & lag_name) const;

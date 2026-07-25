@@ -145,6 +145,23 @@ std::string ValuesStore::get_value(json_t * root, const std::string & path, Valu
 }
 
 ///
+/// Like get_value, but returns false instead of throwing when the path is absent.
+/// @return true and set value when found; false when the path is missing.
+///
+bool ValuesStore::try_get_value(json_t * root, const std::string & path, ValuesStore::json_type type, std::string & value)
+{
+    try
+    {
+        value = get_value(root, path, type);
+        return true;
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+}
+
+///
 /// Extract values for LAG with name lag_name, from the parsed json tree with root, to the temporary storage
 /// @param lag_name a name of the LAG
 /// @param root a pointer to the parsed json tree
@@ -152,6 +169,15 @@ std::string ValuesStore::get_value(json_t * root, const std::string & path, Valu
 ///
 void ValuesStore::extract_values(const std::string & lag_name, json_t * root, HashOfRecords & storage)
 {
+
+    // teamd reports runner.independent_mode (and per-member collecting fields)
+    // unconditionally once the independent-mode patch is present, so coupled
+    // LAGs report it as "false". Export the mode itself whenever present, but
+    // only export the per-member collecting fields when it is actually "true" —
+    // otherwise every coupled member would grow collecting fields fleet-wide.
+    std::string independent_mode;
+    bool has_independent_mode = try_get_value(root, "runner.independent_mode", ValuesStore::json_type::boolean, independent_mode);
+    bool independent_active = has_independent_mode && independent_mode == "true";
 
     const std::string key = "LAG_TABLE|" + lag_name;
     Records lag_values;
@@ -161,6 +187,10 @@ void ValuesStore::extract_values(const std::string & lag_name, json_t * root, Ha
         const auto & type = p.second;
         const auto & value = get_value(root, path, type);
         lag_values.emplace(path, value);
+    }
+    if (has_independent_mode)
+    {
+        lag_values.emplace("runner.independent_mode", independent_mode);
     }
     storage.emplace(key, lag_values);
 
@@ -176,6 +206,23 @@ void ValuesStore::extract_values(const std::string & lag_name, json_t * root, Ha
             const std::string full_path = "ports." + port + "." + path;
             const auto & value = get_value(root, full_path, type);
             member_values.emplace(path, value);
+        }
+
+        if (independent_active)
+        {
+            // A member may lack these mid-transition even when the LAG reports
+            // independent mode, so tolerate absence instead of aborting.
+            for (const auto & ip: m_member_independent_paths)
+            {
+                const auto & path = ip.first;
+                const auto & type = ip.second;
+                const std::string full_path = "ports." + port + "." + path;
+                std::string value;
+                if (try_get_value(root, full_path, type, value))
+                {
+                    member_values.emplace(path, value);
+                }
+            }
         }
         storage.emplace(key, member_values);
     }
@@ -320,6 +367,9 @@ std::vector<std::string> ValuesStore::update_storage(const HashOfRecords & stora
         }
         else
         {
+            // Detects added/changed fields, not removed ones; a field that
+            // disappears (e.g. collecting_* on independent->coupled) lingers in
+            // STATE_DB since Table::set is HSET (observability-only).
             bool is_changed = false;
             for (const auto & row_pair: entry_values)
             {

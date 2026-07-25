@@ -8,7 +8,7 @@ else
 DBGFLAGS = -g
 endif
 
-tlm_teamd_SOURCES = main.cpp teamdctl_mgr.cpp values_store.cpp
+tlm_teamd_SOURCES = main.cpp teamdctl_mgr.cpp values_store.cpp lacp_sync.cpp
 
 tlm_teamd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_ASAN)
 tlm_teamd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(JANSSON_CFLAGS) $(CFLAGS_ASAN)

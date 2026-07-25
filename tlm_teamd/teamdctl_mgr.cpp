@@ -236,6 +236,56 @@ TeamdCtlDump TeamdCtlMgr::get_dump(const std::string & lag_name, bool to_retry)
 }
 
 ///
+/// Write a per-member runner state item back to teamd over teamdctl,
+/// i.e. set ports.<member>.runner.<item> to value
+/// @param lag_name a name for LAG interface
+/// @param member a name of the LAG member port
+/// @param item the runner state item to set
+/// @param value the value to write
+///
+void TeamdCtlMgr::set_member_state(const std::string & lag_name, const std::string & member,
+                                   const std::string & item, const std::string & value)
+{
+    if (!has_key(lag_name))
+    {
+        SWSS_LOG_WARN("Can't set item. LAG not connected. LAG='%s' member='%s' item='%s'",
+                      lag_name.c_str(), member.c_str(), item.c_str());
+        return;
+    }
+
+    const std::string item_path = "ports." + member + ".runner." + item;
+    auto tdc = m_handlers[lag_name];
+    int r = teamdctl_state_item_value_set(tdc, item_path.c_str(), value.c_str());
+    if (r != 0)
+    {
+        SWSS_LOG_INFO("teamdctl set rejected. LAG='%s' path='%s' value='%s' error='%s'",
+                      lag_name.c_str(), item_path.c_str(), value.c_str(), strerror(-r));
+        return;
+    }
+
+    SWSS_LOG_INFO("teamdctl set ok. LAG='%s' path='%s' value='%s'",
+                  lag_name.c_str(), item_path.c_str(), value.c_str());
+}
+
+///
+/// Get names of all tracked LAG interfaces, both connected and pending connect
+/// @return set of LAG names
+///
+std::unordered_set<std::string> TeamdCtlMgr::get_lags() const
+{
+    std::unordered_set<std::string> lags;
+    for (const auto & p: m_handlers)
+    {
+        lags.insert(p.first);
+    }
+    for (const auto & p: m_lags_to_add)
+    {
+        lags.insert(p.first);
+    }
+    return lags;
+}
+
+///
 /// Get dumps for all registered LAG interfaces
 /// @return vector of pairs. Each pair first value is a name of LAG, second value is a dump
 ///
