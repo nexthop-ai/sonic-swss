@@ -54,12 +54,19 @@ int main(int argc, char **argv)
 
         TableConnector conf_lag_table(&conf_db, CFG_LAG_TABLE_NAME);
         TableConnector conf_lag_member_table(&conf_db, CFG_LAG_MEMBER_TABLE_NAME);
+        TableConnector conf_metadata_table(&conf_db, CFG_DEVICE_METADATA_TABLE_NAME);
         TableConnector state_port_table(&state_db, STATE_PORT_TABLE_NAME);
 
         vector<TableConnector> tables = {
             conf_lag_table,
             conf_lag_member_table,
+<<<<<<< HEAD
             state_port_table
+=======
+            conf_metadata_table,
+            state_port_table,
+            state_monitor_link_group_member_table
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
         };
 
         TeamMgr teammgr(&conf_db, &app_db, &state_db, tables);

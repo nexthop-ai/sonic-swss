@@ -11,6 +11,23 @@
 
 namespace swss {
 
+<<<<<<< HEAD
+=======
+struct LagParams
+{
+   int min_links = 0;
+   bool fall_back = false;
+   bool fast_rate = false;
+   std::string lacp_mode;
+};
+
+struct LagInfo
+{
+    LagParams params;
+    std::set<std::string> members;
+};
+
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
 class TeamMgr : public Orch
 {
 public:
@@ -40,9 +57,10 @@ private:
     void doTask(Consumer &consumer);
     void doLagTask(Consumer &consumer);
     void doLagMemberTask(Consumer &consumer);
+    void doDeviceMetadataTask(Consumer &consumer);
     void doPortUpdateTask(Consumer &consumer);
 
-    task_process_status addLag(const std::string &alias, int min_links, bool fall_back, bool fast_rate);
+    task_process_status addLag(const std::string &alias, int min_links, bool fall_back, bool fast_rate, const std::string &lacp_mode);
     bool removeLag(const std::string &alias);
     task_process_status addLagMember(const std::string &lag, const std::string &member);
     bool removeLagMember(const std::string &lag, const std::string &member);
@@ -61,6 +79,20 @@ private:
     bool isMACsecAttached(const std::string &);
     bool isMACsecIngressSAOk(const std::string &);
     uint16_t generateLacpKey(const std::string&);
+<<<<<<< HEAD
+=======
+    std::string getDefaultLacpMode();
+
+    void addLagParams(const std::string &alias, const int min_links, const bool fall_back, const bool fast_rate, const std::string &lacp_mode);
+    void removeLagParams(const std::string &alias);
+    LagInfo& getOrCreateLagInfo(const std::string &alias);
+    void removeLagInfo(const std::string &alias);
+    void addLagMemberInfo(const std::string &lag, const std::string &member);
+    void removeLagMemberInfo(const std::string &lag, const std::string &member);
+    bool isIntrinsicParamsChanged(const std::string &alias, const int min_links,
+        const bool fall_back, const bool fast_rate, const std::string &lacp_mode);
+    bool restartLag(const std::string &alias, const int min_links, const bool fall_back, const bool fast_rate, const std::string &lacp_mode);
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
 };
 
 }

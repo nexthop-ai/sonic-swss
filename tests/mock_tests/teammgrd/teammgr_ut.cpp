@@ -218,6 +218,23 @@ int cb(const std::string &cmd, std::string &stdout)
     }
     else
     {
+<<<<<<< HEAD
+=======
+        // Handle PortChannel100-119 for intrinsic param change and lacp_mode tests
+        for (int i = 100; i <= 119; i++)
+        {
+            if (cmd.find(std::string("/usr/bin/teamd -r -t PortChannel") + std::to_string(i)) != std::string::npos)
+            {
+                mkdir("/var/run/teamd", 0755);
+                std::FILE *pidFile = std::tmpfile();
+                std::fputs(std::to_string(1000 + i).c_str(), pidFile);
+                std::rewind(pidFile);
+                pidFiles[std::string("/var/run/teamd/PortChannel") + std::to_string(i) + std::string(".pid")] = pidFile;
+                return 0;
+            }
+        }
+
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
         for (int i = 600; i < 620; i++)
         {
             if (cmd.find(std::string("/usr/bin/teamd -r -t PortChannel") + std::to_string(i)) != std::string::npos)
@@ -252,11 +269,13 @@ namespace teammgr_ut
 
             TableConnector conf_lag_table(m_config_db.get(), CFG_LAG_TABLE_NAME);
             TableConnector conf_lag_member_table(m_config_db.get(), CFG_LAG_MEMBER_TABLE_NAME);
+            TableConnector conf_metadata_table(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
             TableConnector state_port_table(m_state_db.get(), STATE_PORT_TABLE_NAME);
 
             std::vector<TableConnector> tables = {
                 conf_lag_table,
                 conf_lag_member_table,
+                conf_metadata_table,
                 state_port_table
             };
 
@@ -509,5 +528,170 @@ namespace teammgr_ut
         EXPECT_TRUE(std::any_of(values.begin(), values.end(), [](const auto &fv) {
             return fvField(fv) == "system_mac" && fvValue(fv) == "02:03:04:05:06:07";
         }));
+    }
+
+    TEST_F(TeamMgrTest, testAddLag_IndependentMode)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+
+        cfg_lag_table.set("PortChannel108", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "independent" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        EXPECT_TRUE(findCommandWith({"PortChannel108", "\"independent_mode\":true"}));
+    }
+
+    TEST_F(TeamMgrTest, testAddLag_CoupledModeDefault)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+
+        cfg_lag_table.set("PortChannel109", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "coupled" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        for (const auto& cmd : mockCallArgs) {
+            if (cmd.find("PortChannel109") != std::string::npos &&
+                cmd.find("/usr/bin/teamd") != std::string::npos) {
+                EXPECT_EQ(cmd.find("\"independent_mode\":true"), std::string::npos);
+            }
+        }
+    }
+
+    TEST_F(TeamMgrTest, testAddLag_InheritGlobalDefaultIndependent)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        swss::Table metadata_table = swss::Table(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
+
+        // Global default is independent, port channel has no lacp_mode of its own
+        metadata_table.set("localhost", { { "default_lacp_mode", "independent" } });
+        cfg_lag_table.set("PortChannel110", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        // Should inherit the global default and start teamd in independent mode
+        EXPECT_TRUE(findCommandWith({"PortChannel110", "\"independent_mode\":true"}));
+    }
+
+    TEST_F(TeamMgrTest, testAddLag_PerPcOverridesGlobalDefault)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        swss::Table metadata_table = swss::Table(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
+
+        // Global default is independent, but the port channel explicitly asks for coupled
+        metadata_table.set("localhost", { { "default_lacp_mode", "independent" } });
+        cfg_lag_table.set("PortChannel111", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "coupled" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        // Per-port-channel setting wins: teamd must not run in independent mode
+        for (const auto& cmd : mockCallArgs) {
+            if (cmd.find("PortChannel111") != std::string::npos &&
+                cmd.find("/usr/bin/teamd") != std::string::npos) {
+                EXPECT_EQ(cmd.find("\"independent_mode\":true"), std::string::npos);
+            }
+        }
+    }
+
+    TEST_F(TeamMgrTest, testAddLag_NoGlobalDefaultDefaultsCoupled)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+
+        // No default_lacp_mode in DEVICE_METADATA and no per-port-channel lacp_mode -> coupled
+        cfg_lag_table.set("PortChannel112", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        for (const auto& cmd : mockCallArgs) {
+            if (cmd.find("PortChannel112") != std::string::npos &&
+                cmd.find("/usr/bin/teamd") != std::string::npos) {
+                EXPECT_EQ(cmd.find("\"independent_mode\":true"), std::string::npos);
+            }
+        }
+    }
+
+    TEST_F(TeamMgrTest, testIntrinsicParamChange_LacpMode)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+
+        cfg_lag_table.set("PortChannel106", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "coupled" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        mockCallArgs.clear();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel106", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "independent" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        EXPECT_GT(mockKillCommands.size(), 0);
+        EXPECT_TRUE(findCommandWith({"PortChannel106", "\"independent_mode\":true"}));
+    }
+
+    // A default_lacp_mode change restarts default-mode LAGs into the new mode, and
+    // leaves LAGs with an explicit lacp_mode untouched.
+    TEST_F(TeamMgrTest, testDefaultLacpModeChangeRestartsDefaultModeLags)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        swss::Table metadata_table = swss::Table(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
+
+        // PortChannel114 relies on the default; PortChannel115 pins coupled explicitly
+        cfg_lag_table.set("PortChannel114", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" } });
+        cfg_lag_table.set("PortChannel115", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" },
+                                              { "min_links", "1" },
+                                              { "lacp_mode", "coupled" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        mockCallArgs.clear();
+        mockKillCommands.clear();
+
+        // Flip the global default to independent
+        metadata_table.set("localhost", { { "default_lacp_mode", "independent" } });
+        teammgr.addExistingData(&metadata_table);
+        teammgr.doTask();
+
+        // Default-mode LAG restarts into independent; explicit-mode LAG is untouched
+        EXPECT_GT(mockKillCommands.size(), 0);
+        EXPECT_TRUE(findCommandWith({"PortChannel114", "\"independent_mode\":true"}));
+        EXPECT_EQ(countTeamdStarts("PortChannel115"), 0);
     }
 }

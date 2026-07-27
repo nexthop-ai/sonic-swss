@@ -163,6 +163,10 @@ void TeamMgr::doTask(Consumer &consumer)
     {
         doLagMemberTask(consumer);
     }
+    else if (table == CFG_DEVICE_METADATA_TABLE_NAME)
+    {
+        doDeviceMetadataTask(consumer);
+    }
     else if (table == STATE_PORT_TABLE_NAME)
     {
         doPortUpdateTask(consumer);
@@ -235,6 +239,10 @@ void TeamMgr::cleanTeamProcesses()
 void TeamMgr::doLagTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
+
+    // Resolve the system-wide default LACP mode once per pass, not per LAG.
+    const string default_lacp_mode = getDefaultLacpMode();
+
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
@@ -248,6 +256,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
             int min_links = 0;
             bool fallback = false;
             bool fast_rate = false;
+            string lacp_mode = default_lacp_mode;
             string admin_status = DEFAULT_ADMIN_STATUS_STR;
             string mtu = DEFAULT_MTU_STR;
             string learn_mode;
@@ -297,6 +306,20 @@ void TeamMgr::doLagTask(Consumer &consumer)
                     SWSS_LOG_INFO("Get fast_rate `%s`",
                                   fast_rate ? "true" : "false");
                 }
+                else if (fvField(i) == "lacp_mode")
+                {
+                    lacp_mode = fvValue(i);
+                    // "couple" is a legacy alias for "coupled" (pre-rename
+                    // CONFIG_DB rows written by older sonic-utilities).
+                    // Normalize so stored state and intrinsic-change detection
+                    // use the canonical value and don't spuriously restart the
+                    // LAG when a "couple" row is later rewritten as "coupled".
+                    if (lacp_mode == "couple")
+                    {
+                        lacp_mode = "coupled";
+                    }
+                    SWSS_LOG_INFO("Get lacp_mode %s", lacp_mode.c_str());
+                }
                 else if (fvField(i) == "system_mac")
                 {
                     sys_mac = fvValue(i);
@@ -306,7 +329,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
 
             if (m_lagList.find(alias) == m_lagList.end())
             {
-                if (addLag(alias, min_links, fallback, fast_rate) == task_need_retry)
+                if (addLag(alias, min_links, fallback, fast_rate, lacp_mode) == task_need_retry)
                 {
                     // If LAG creation fails, we need to clean up any potentially orphaned teamd processes
                     removeLag(alias);
@@ -315,6 +338,17 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 }
 
                 m_lagList.insert(alias);
+<<<<<<< HEAD
+=======
+            } else {
+                if (isIntrinsicParamsChanged(alias, min_links, fallback, fast_rate, lacp_mode)) {
+                    if (!restartLag(alias, min_links, fallback, fast_rate, lacp_mode)) {
+                        SWSS_LOG_ERROR("Failed to restart port channel %s with new attributes", alias.c_str());
+                        it++;
+                        continue;
+                   }
+                }
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
             }
 
             setLagAdminStatus(alias, admin_status);
@@ -680,7 +714,7 @@ bool TeamMgr::setLagSysmac(const string &alias, string &sys_mac)
     return true;
 }
 
-task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback, bool fast_rate)
+task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback, bool fast_rate, const string &lacp_mode)
 {
     SWSS_LOG_ENTER();
 
@@ -742,6 +776,11 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
         conf << ",\"fast_rate\":true";
     }
 
+    if (lacp_mode == "independent")
+    {
+        conf << ",\"independent_mode\":true";
+    }
+
     conf << "}}'";
 
     SWSS_LOG_INFO("Port channel %s teamd configuration: %s",
@@ -763,6 +802,11 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
         return task_need_retry;
     }
 
+<<<<<<< HEAD
+=======
+    addLagParams(alias, min_links, fallback, fast_rate, lacp_mode);
+
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
     SWSS_LOG_NOTICE("Start port channel %s with teamd", alias.c_str());
 
     return task_success;
@@ -843,6 +887,76 @@ uint16_t TeamMgr::generateLacpKey(const string& lag)
         }
     }
     return 0;
+}
+
+// React to a default_lacp_mode change: restart every port channel that inherits
+// the default (no explicit lacp_mode) and whose effective mode changed.
+void TeamMgr::doDeviceMetadataTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+
+        if (kfvKey(t) == "localhost" && kfvOp(t) == SET_COMMAND)
+        {
+            string default_lacp_mode = getDefaultLacpMode();
+
+            for (const auto &alias : m_lagList)
+            {
+                vector<FieldValueTuple> fvs;
+                m_cfgLagTable.get(alias, fvs);
+                if (swss::fvsGetValue(fvs, "lacp_mode", true))
+                {
+                    continue;
+                }
+
+                LagInfo &lagInfo = getOrCreateLagInfo(alias);
+                if (lagInfo.params.lacp_mode == default_lacp_mode)
+                {
+                    continue;
+                }
+
+                SWSS_LOG_NOTICE("Default LACP mode changed to %s, restarting port channel %s",
+                                default_lacp_mode.c_str(), alias.c_str());
+
+                if (!restartLag(alias, lagInfo.params.min_links, lagInfo.params.fall_back,
+                                lagInfo.params.fast_rate, default_lacp_mode))
+                {
+                    SWSS_LOG_ERROR("Failed to restart port channel %s for default LACP mode change", alias.c_str());
+                }
+            }
+        }
+
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+// Read the system-wide default LACP mode from DEVICE_METADATA|localhost:default_lacp_mode.
+string TeamMgr::getDefaultLacpMode()
+{
+    vector<FieldValueTuple> fvs;
+    m_cfgMetadataTable.get("localhost", fvs);
+
+    auto default_mode = swss::fvsGetValue(fvs, "default_lacp_mode", true);
+    string lacp_mode = default_mode ? *default_mode : "coupled";
+
+    // "couple" is a legacy alias for "coupled" written by older tooling;
+    // accept and normalize it instead of warning and coercing.
+    if (lacp_mode == "couple")
+    {
+        lacp_mode = "coupled";
+    }
+
+    if (lacp_mode != "independent" && lacp_mode != "coupled")
+    {
+        SWSS_LOG_WARN("Unrecognized default_lacp_mode '%s', defaulting to coupled", lacp_mode.c_str());
+        lacp_mode = "coupled";
+    }
+
+    return lacp_mode;
 }
 
 // Once a port is enslaved into a port channel, the port's MTU will
@@ -996,3 +1110,358 @@ bool TeamMgr::removeLagMember(const string &lag, const string &member)
 
     return true;
 }
+<<<<<<< HEAD
+=======
+
+
+void TeamMgr::doMonitorLinkGroupMemberTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+
+        string interface_name = kfvKey(t);
+        string op = kfvOp(t);
+        auto data = kfvFieldsValues(t);
+
+        // Only process PortChannel interfaces in teammgr
+        if (interface_name.find("PortChannel") != 0)
+        {
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        if (op == SET_COMMAND)
+        {
+            SWSS_LOG_INFO("TeamMgr: Processing monitor link group member SET for %s", interface_name.c_str());
+
+            // Parse state and down_due_to from STATE_DB
+            string monitor_link_state = "";
+            string down_due_to = "";
+
+            for (const auto &idx : data)
+            {
+                const auto &field = fvField(idx);
+                const auto &value = fvValue(idx);
+
+                if (field == "state")
+                {
+                    monitor_link_state = value;
+                }
+                else if (field == "down_due_to")
+                {
+                    down_due_to = value;
+                }
+            }
+
+            // Early exit if no state provided
+            if (monitor_link_state.empty())
+            {
+                SWSS_LOG_WARN("TeamMgr: No state provided for interface %s, skipping", interface_name.c_str());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
+
+            // Get current configuration admin status
+            vector<FieldValueTuple> lag_data;
+            if (m_cfgLagTable.get(interface_name, lag_data))
+            {
+                bool config_admin_up = true; // Default to up if not specified
+                for (const auto &fv : lag_data)
+                {
+                    if (fvField(fv) == "admin_status")
+                    {
+                        config_admin_up = (fvValue(fv) == "up");
+                        break;
+                    }
+                }
+
+                // Combine monitor link state with configuration state
+                bool should_be_up = (monitor_link_state == "allow_up") && config_admin_up;
+
+                SWSS_LOG_INFO("TeamMgr: Interface %s - monitor_link_state: %s, config_admin_up: %s, final_state: %s, down_due_to: %s",
+                             interface_name.c_str(), monitor_link_state.c_str(),
+                             config_admin_up ? "up" : "down", should_be_up ? "up" : "down", down_due_to.c_str());
+
+                // Apply the combined state to the LAG interface using setLagAdminStatus
+                // which uses ip link set to actually bring the interface up/down
+                setLagAdminStatus(interface_name, should_be_up ? "up" : "down");
+            }
+            else
+            {
+                SWSS_LOG_WARN("TeamMgr: Could not get configuration for interface %s", interface_name.c_str());
+            }
+        }
+        else if (op == DEL_COMMAND)
+        {
+            SWSS_LOG_INFO("TeamMgr: Processing monitor link group member DEL for %s", interface_name.c_str());
+
+            // When monitor link control is removed, restore interface to its configuration state
+            vector<FieldValueTuple> lag_data;
+            if (m_cfgLagTable.get(interface_name, lag_data))
+            {
+                bool config_admin_up = true; // Default to up if not specified
+                for (const auto &fv : lag_data)
+                {
+                    if (fvField(fv) == "admin_status")
+                    {
+                        config_admin_up = (fvValue(fv) == "up");
+                        break;
+                    }
+                }
+
+                SWSS_LOG_INFO("TeamMgr: Restoring interface %s to configuration state: %s",
+                             interface_name.c_str(), config_admin_up ? "up" : "down");
+
+                // Use setLagAdminStatus to actually bring the interface up/down
+                setLagAdminStatus(interface_name, config_admin_up ? "up" : "down");
+            }
+        }
+
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+// v0 PortChannel micro-BFD: derive the APPL_DB BFD_SESSION_TABLE parent row(s) from
+// PORTCHANNEL config and publish them. bfdorch detects a LAG-aliased parent and fans
+// out per-member offloaded sessions. teamd is intentionally untouched in v0 (the
+// min_links / forwarding gate is deferred to v1).
+void TeamMgr::updateMicroBfdParent(const string &alias, bool enable,
+                                   const string &peer_v4, const string &peer_v6,
+                                   uint32_t tx_interval, uint32_t rx_interval,
+                                   uint8_t multiplier)
+{
+    SWSS_LOG_ENTER();
+
+    // Idempotent: withdraw whatever we previously published for this LAG, then
+    // (re)publish from the current config.
+    removeMicroBfdParent(alias);
+
+    if (!enable)
+    {
+        return;
+    }
+
+    vector<pair<string, bool>> afs = { { peer_v4, false }, { peer_v6, true } };
+
+    for (const auto &af : afs)
+    {
+        const string &peer = af.first;
+        bool v6 = af.second;
+
+        if (peer.empty())
+        {
+            continue;
+        }
+
+        string local_ip;
+        if (!getLagLocalIp(alias, v6, local_ip))
+        {
+            SWSS_LOG_WARN("micro-BFD: %s has no %s address configured; skipping parent "
+                          "(re-apply micro_bfd after configuring the PortChannel IP)",
+                          alias.c_str(), v6 ? "IPv6" : "IPv4");
+            continue;
+        }
+
+        // bfdorch key: <vrf>:<alias>:<peer>. Default VRF for v0.
+        string key = string("default:") + alias + ":" + peer;
+
+        vector<FieldValueTuple> fvs = {
+            { "local_addr",  local_ip },
+            { "type",        "async_active" },
+            { "dst_mac",     MICRO_BFD_DST_MAC },
+            { "multihop",    "false" },
+            { "tx_interval", to_string(tx_interval) },
+            { "rx_interval", to_string(rx_interval) },
+            { "multiplier",  to_string(static_cast<unsigned>(multiplier)) },
+        };
+
+        m_appBfdSessionTable.set(key, fvs);
+        m_microBfdParentKeys[alias].push_back(key);
+
+        SWSS_LOG_NOTICE("micro-BFD: published parent %s (local %s peer %s tx/rx/mult %u/%u/%u)",
+                        alias.c_str(), local_ip.c_str(), peer.c_str(),
+                        tx_interval, rx_interval, static_cast<unsigned>(multiplier));
+    }
+}
+
+void TeamMgr::removeMicroBfdParent(const string &alias)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_microBfdParentKeys.find(alias);
+    if (it == m_microBfdParentKeys.end())
+    {
+        return;
+    }
+
+    for (const auto &key : it->second)
+    {
+        m_appBfdSessionTable.del(key);
+        SWSS_LOG_NOTICE("micro-BFD: withdrew parent %s", key.c_str());
+    }
+    m_microBfdParentKeys.erase(it);
+}
+
+// Look up the PortChannel's own IP (from PORTCHANNEL_INTERFACE) to use as the BFD
+// source address. Returns the first configured address of the requested family.
+bool TeamMgr::getLagLocalIp(const string &alias, bool v6, string &ip_out)
+{
+    SWSS_LOG_ENTER();
+
+    vector<string> keys;
+    m_cfgLagIntfTable.getKeys(keys);
+
+    for (const auto &k : keys)
+    {
+        auto tokens = tokenize(k, config_db_key_delimiter);
+        if (tokens.size() != 2 || tokens[0] != alias)
+        {
+            continue;   // skip the plain "PortChannelX" row and other LAGs
+        }
+
+        string ip = tokens[1];
+        auto slash = ip.find('/');
+        if (slash != string::npos)
+        {
+            ip = ip.substr(0, slash);
+        }
+
+        bool is_v6 = ip.find(':') != string::npos;
+        if (is_v6 == v6)
+        {
+            ip_out = ip;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TeamMgr::addLagParams(const std::string &alias, const int min_links, const bool fall_back, const bool fast_rate, const std::string &lacp_mode)
+{
+    LagInfo& lagInfo = getOrCreateLagInfo(alias);
+    lagInfo.params.min_links = min_links;
+    lagInfo.params.fall_back = fall_back;
+    lagInfo.params.fast_rate = fast_rate;
+    lagInfo.params.lacp_mode = lacp_mode;
+}
+
+void TeamMgr::removeLagParams(const std::string &alias)
+{
+    auto it = m_lagInfo.find(alias);
+    if (it != m_lagInfo.end()) {
+        it->second.params = LagParams();
+    }
+}
+
+LagInfo& TeamMgr::getOrCreateLagInfo(const std::string &alias)
+{
+    auto it = m_lagInfo.find(alias);
+    if (it == m_lagInfo.end()) {
+        m_lagInfo[alias] = LagInfo();
+    }
+    return m_lagInfo[alias];
+}
+
+void TeamMgr::removeLagInfo(const std::string &alias)
+{
+    m_lagInfo.erase(alias);
+}
+
+void TeamMgr::addLagMemberInfo(const std::string &lag, const std::string &member)
+{
+    LagInfo& lagInfo = getOrCreateLagInfo(lag);
+    lagInfo.members.insert(member);
+}
+
+void TeamMgr::removeLagMemberInfo(const std::string &lag, const std::string &member)
+{
+    auto it = m_lagInfo.find(lag);
+    if (it != m_lagInfo.end()) {
+        it->second.members.erase(member);
+    }
+}
+
+bool TeamMgr::isIntrinsicParamsChanged(const std::string &alias, const int min_links,
+    const bool fall_back, const bool fast_rate, const std::string &lacp_mode)
+{
+    LagInfo& lagInfo = getOrCreateLagInfo(alias);
+    std::string changedStr = "";
+    bool changed = false;
+
+    auto updateChangedStr = [&changedStr](const std::string& paramName, const auto& oldValue, const auto& newValue) {
+        std::ostringstream oss;
+        oss << paramName << " changed from " << oldValue << " to " << newValue << "; ";
+        changedStr += oss.str();
+    };
+
+    if (lagInfo.params.min_links != min_links) {
+        updateChangedStr("min_links", lagInfo.params.min_links, min_links);
+        changed = true;
+    }
+
+    if (lagInfo.params.fall_back != fall_back) {
+        updateChangedStr("fall_back", lagInfo.params.fall_back, fall_back);
+        changed = true;
+    }
+
+    if (lagInfo.params.fast_rate != fast_rate) {
+        updateChangedStr("fast_rate", lagInfo.params.fast_rate, fast_rate);
+        changed = true;
+    }
+
+    if (lagInfo.params.lacp_mode != lacp_mode) {
+        updateChangedStr("lacp_mode", lagInfo.params.lacp_mode, lacp_mode);
+        changed = true;
+    }
+
+    if (changed) {
+        SWSS_LOG_INFO("Intrinsic params of LAG %s has changed: %s", alias.c_str(), changedStr.c_str());
+    }
+
+    return changed;
+}
+
+bool TeamMgr::restartLag(const std::string &alias, const int min_links, const bool fall_back, const bool fast_rate, const std::string &lacp_mode)
+{
+    // Save member list and parameters before removing LAG
+    LagInfo& lagInfo = getOrCreateLagInfo(alias);
+    const std::set<std::string> savedMembers = lagInfo.members;
+    LagParams savedParams = lagInfo.params;
+
+    bool removed = removeLag(alias);
+    if (removed) {
+        task_process_status status = addLag(alias, min_links, fall_back, fast_rate, lacp_mode);
+
+        auto restoreMembers = [this, alias, &savedMembers]() {
+            for (const auto& member : savedMembers) {
+                addLagMember(alias, member);
+            }
+        }; 
+
+        if (status == task_need_retry) {
+            // addLag failed, need to restore the LAG with old parameters and members
+            // so it can be retried in the next iteration
+            SWSS_LOG_WARN("Port channel %s restart failed (retry needed), restoring with old parameters and members", alias.c_str());
+
+            if (addLag(alias, savedParams.min_links, savedParams.fall_back, savedParams.fast_rate, savedParams.lacp_mode) == task_success) {
+                restoreMembers();
+                SWSS_LOG_NOTICE("Restored port channel %s with old parameters after restart failure", alias.c_str());
+            } else {
+                SWSS_LOG_ERROR("Failed to restore port channel %s after restart failure; LAG is now missing and will not be retried until its config changes", alias.c_str());
+            }
+            return false;
+        }
+
+        restoreMembers();
+
+        SWSS_LOG_NOTICE("Restart port channel %s with new attributes", alias.c_str());
+    }
+
+    return removed;
+}
+>>>>>>> a295efcc (NOS-10884: teammgrd: start teamd with configured LACP mode (independent/coupled) (#756))
