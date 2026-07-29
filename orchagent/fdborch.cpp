@@ -1760,6 +1760,20 @@ void FdbOrch::updateVlanMember(const VlanMemberUpdate& update)
         swss::Port port = update.member;
         flushFDBEntries(port.m_bridge_port_id, vlan.m_vlan_info.vlan_oid);
         notifyObserversFDBFlush(port, vlan.m_vlan_info.vlan_oid);
+
+        // Immediately clear bookkeeping for flushed dynamic FDB entries instead of 
+        // relying on syncd notifications. 
+        for (auto itr = m_entries.begin(); itr != m_entries.end();)
+        {
+            auto curr = itr++;
+            if (curr->first.bv_id == vlan.m_vlan_info.vlan_oid &&
+                curr->second.bridge_port_id == port.m_bridge_port_id &&
+                curr->second.sai_fdb_type == SAI_FDB_ENTRY_TYPE_DYNAMIC &&
+                curr->second.is_flush_pending)
+            {
+                clearFdbEntry(curr->first, curr->second);
+            }
+        }
         return;
     }
 

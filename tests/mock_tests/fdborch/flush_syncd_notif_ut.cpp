@@ -696,6 +696,50 @@ namespace fdb_syncd_flush_test
         _unhook_sai_fdb_api();
     }
 
+    /* VLAN FDB refcount leak on VLAN member removal */
+    TEST_F(FdbOrchTest, VlanMemberRemovalClearsFdbCountWithoutSyncdNotif)
+    {
+        _hook_sai_fdb_api();
+
+        ASSERT_NE(m_portsOrch, nullptr);
+        setUpVlan(m_portsOrch.get());
+        setUpPort(m_portsOrch.get());
+        setUpVlanMember(m_portsOrch.get());
+
+        /* Learn a dynamic FDB entry on Ethernet0/Vlan40. */
+        vector<uint8_t> mac_addr = {124, 254, 144, 18, 34, 236};
+        triggerUpdate(m_fdborch.get(), SAI_FDB_EVENT_LEARNED, mac_addr,
+                      m_portsOrch->m_portList[ETH0].m_bridge_port_id,
+                      m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid);
+
+        ASSERT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 1);
+        ASSERT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 1);
+
+        g_sai_flush_call_count = 0;
+
+        /* Remove the port from the VLAN */
+        VlanMemberUpdate update;
+        update.vlan = m_portsOrch->m_portList[VLAN40];
+        update.member = m_portsOrch->m_portList[ETH0];
+        update.add = false;
+
+        m_fdborch->updateVlanMember(update);
+
+        /* SAI flush was requested... */
+        ASSERT_GE(g_sai_flush_call_count, 1);
+
+        ASSERT_EQ(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+        ASSERT_EQ(m_portsOrch->m_portList[ETH0].m_fdb_count, 0);
+
+        FdbEntry fdb_entry;
+        fdb_entry.mac = MacAddress("7c:fe:90:12:22:ec");
+        fdb_entry.bv_id = m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid;
+        ASSERT_EQ(m_fdborch->m_entries.find(fdb_entry), m_fdborch->m_entries.end())
+            << "Dynamic entry survived VLAN member removal without a syncd notification";
+
+        _unhook_sai_fdb_api();
+    }
+
     /*
      * Regression test: sai_fdb_type must not bleed across events in a batch.
      *
