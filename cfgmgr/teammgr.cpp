@@ -768,6 +768,32 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
     return task_success;
 }
 
+// Teardown couldn't signal teamd (no pid file, or a stale one). If the netdev is
+// still up with an orphaned teamd, delete it so teamsyncd tears down the LAG.
+void TeamMgr::forceRemoveLagDevice(const string &alias)
+{
+    stringstream cmd;
+    string res;
+
+    cmd << IP_CMD << " link show dev " << shellquote(alias);
+    if (exec(cmd.str(), res) != 0)
+    {
+        // Device is gone: teamd was really stopped, nothing to clean up.
+        return;
+    }
+
+    cmd.str("");
+    cmd << IP_CMD << " link del dev " << shellquote(alias);
+    if (exec(cmd.str(), res))
+    {
+        SWSS_LOG_ERROR("Failed to remove leftover port channel device %s", alias.c_str());
+    }
+    else
+    {
+        SWSS_LOG_WARN("Removed leftover port channel device %s by hand", alias.c_str());
+    }
+}
+
 bool TeamMgr::removeLag(const string &alias)
 {
     SWSS_LOG_ENTER();
@@ -781,11 +807,39 @@ bool TeamMgr::removeLag(const string &alias)
             pidfile >> pid;
             SWSS_LOG_INFO("Read port channel %s pid %d", alias.c_str(), pid);
         }
+<<<<<<< HEAD
         else
+=======
+    }
+
+    if (pid < 0)
+    {
+        /* No pid file: teamd is already gone -- it crashed, or a previous
+         * restart attempt died between the stop and the respawn. Report
+         * success so the caller can proceed to a respawn. Returning false
+         * here used to wedge doLagTask's restart path permanently: the SET
+         * task is retained, every retry re-enters removeLag, and addLag is
+         * never reached because the alias never leaves m_lagList (so the
+         * create branch is unreachable). The LAG then stays teamd-less until
+         * its config row is deleted. Fall through to the same bookkeeping a
+         * real stop performs so the respawn starts clean. */
+        SWSS_LOG_NOTICE("Port channel %s has no teamd pid file; treating it as already stopped", alias.c_str());
+        forceRemoveLagDevice(alias);
+    }
+    else if (kill(pid, SIGTERM))
+    {
+        if (errno != ESRCH)
+>>>>>>> cef863cd (NOS-12927: [teammgr]: guarantee PortChannel teardown when the teamd pid file is gone (#912))
         {
             SWSS_LOG_NOTICE("Failed to remove non-existent port channel %s pid...", alias.c_str());
             return false;
         }
+<<<<<<< HEAD
+=======
+        // Stale pid file, process already gone: same as no pid file at all.
+        SWSS_LOG_NOTICE("Port channel %s teamd pid %d is already gone; treating it as stopped", alias.c_str(), pid);
+        forceRemoveLagDevice(alias);
+>>>>>>> cef863cd (NOS-12927: [teammgr]: guarantee PortChannel teardown when the teamd pid file is gone (#912))
     }
 
     if (kill(pid, SIGTERM))

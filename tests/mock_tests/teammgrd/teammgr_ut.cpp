@@ -316,8 +316,33 @@ namespace teammgr_ut
         teammgr.doTask();
         ASSERT_NE(mockCallArgs.size(), 0);
         EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel812"), std::string::npos);
-        EXPECT_EQ(mockCallArgs.size(), 1);
         EXPECT_EQ(mockKillCommands.size(), 0);
+        // No pid file: removeLag deletes the leftover netdev so teamsyncd tears
+        // down the LAG instead of leaking it.
+        EXPECT_TRUE(findCommandWith({"/sbin/ip link del dev", "PortChannel812"}));
+    }
+
+    TEST_F(TeamMgrTest, testLagDeleteReapsOrphanedTeamdWithoutPidFile)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel813", { { "admin_status", "up" },
+                                              { "mtu", "9100" },
+                                              { "lacp_key", "auto" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        mockCallArgs.clear();
+
+        auto consumer = std::unique_ptr<Consumer>(new Consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), CFG_LAG_TABLE_NAME, 1, 1),
+            &teammgr, CFG_LAG_TABLE_NAME));
+        consumer->addToSync({ { "PortChannel813", DEL_COMMAND, {} } });
+        static_cast<Orch *>(&teammgr)->doTask(*consumer.get());
+
+        // PortChannel813 has no mocked pid file, so the SIGTERM path is skipped
+        // and the leftover netdev is deleted instead of leaking.
+        EXPECT_EQ(mockKillCommands.size(), 0);
+        EXPECT_TRUE(findCommandWith({"/sbin/ip link del dev", "PortChannel813"}));
     }
 
     TEST_F(TeamMgrTest, testProcessCleanupAfterAddLag)

@@ -44,6 +44,11 @@ private:
 
     task_process_status addLag(const std::string &alias, int min_links, bool fall_back, bool fast_rate);
     bool removeLag(const std::string &alias);
+<<<<<<< HEAD
+=======
+    void forceRemoveLagDevice(const std::string &alias);
+    void waitForTeamdToStop(const std::string &alias, pid_t pid);
+>>>>>>> cef863cd (NOS-12927: [teammgr]: guarantee PortChannel teardown when the teamd pid file is gone (#912))
     task_process_status addLagMember(const std::string &lag, const std::string &member);
     bool removeLagMember(const std::string &lag, const std::string &member);
 
