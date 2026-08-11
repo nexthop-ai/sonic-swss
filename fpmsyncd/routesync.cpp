@@ -3549,16 +3549,42 @@ string RouteSync::getNextHopWt(struct rtnl_route *route_obj)
     for (int i = 0; i < rtnl_route_get_nnexthops(route_obj); i++)
     {
         struct rtnl_nexthop *nexthop = rtnl_route_nexthop_n(route_obj, i);
-        /* Get the weight of next hop */
+        /* Get the weight of next hop. rtnl_route_nh_get_weight() returns the
+         * raw netlink rtnh_hops byte, which encodes (true_weight - 1) per
+         * netlink convention (see zebra/rt_netlink.c's use of rtnh_hops+1/-1
+         * on the FRR side); it must be converted back with +1 before use. A
+         * raw value of 0 also covers the "no weight attribute set" case,
+         * which correctly maps to the default weight of 1. */
         uint8_t weight = rtnl_route_nh_get_weight(nexthop);
         if (weight == 0)
         {
             SWSS_LOG_INFO("Using default weight of 1 for nexthop");
-            weight = 1; // default weight is 1
+        }
+        result += to_string(weight + 1);
+
+<<<<<<< HEAD
+        if (i + 1 < rtnl_route_get_nnexthops(route_obj))
+=======
+        if (i + 1 < libnl_count || !m_pendingBackupNexthops.empty())
+        {
+            result += string(",");
+        }
+    }
+
+    /* Append backup weights from FPM_RTA_BACKUP_NH (parallel with gw/intf/mpls). */
+    for (size_t b = 0; b < m_pendingBackupNexthops.size(); b++)
+    {
+        /* Already converted to true weight in setPendingBackupNexthopsFromRawMsg()
+         * (rtnh_hops + 1 applied at parse time) — do not add +1 again here. */
+        uint8_t weight = m_pendingBackupNexthops[b].weight;
+        if (weight == 0)
+        {
+            weight = 1;
         }
         result += to_string(weight);
 
-        if (i + 1 < rtnl_route_get_nnexthops(route_obj))
+        if (b + 1 < m_pendingBackupNexthops.size())
+>>>>>>> 88ab5d14 (NOS-13441: fpmsyncd: Fix off-by-one nexthop weight sent to APPL_DB (#983))
         {
             result += string(",");
         }

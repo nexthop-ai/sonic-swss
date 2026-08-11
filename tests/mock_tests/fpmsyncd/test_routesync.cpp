@@ -1279,6 +1279,1190 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
     rtnl_route_put(test_route);
 }
 
+<<<<<<< HEAD
+=======
+TEST_F(FpmSyncdResponseTest, TestRouteWithBackupNexthop)
+{
+    // Test route with primary and backup nexthops. Backup arrives via the
+    // FPM_RTA_BACKUP_NH side channel that FpmLink would populate from the raw
+    // nlmsghdr; the test bypasses FpmLink and injects directly.
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    const char* test_prefix = "10.4.0.0/24";
+    const char* primary_gw = "10.0.0.1";
+    const char* backup_gw = "10.0.0.65";
+
+    // Create a route with 1 primary nexthop in the libnl rtnl_route
+    rtnl_route* route = rtnl_route_alloc();
+    nl_addr* dst_addr;
+    nl_addr_parse(test_prefix, AF_INET, &dst_addr);
+    rtnl_route_set_dst(route, dst_addr);
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_table(route, RT_TABLE_MAIN);
+    nl_addr_put(dst_addr);
+
+    // Add primary nexthop
+    rtnl_nexthop* nh_primary = rtnl_route_nh_alloc();
+    nl_addr* gw_primary;
+    nl_addr_parse(primary_gw, AF_INET, &gw_primary);
+    rtnl_route_nh_set_gateway(nh_primary, gw_primary);
+    rtnl_route_nh_set_ifindex(nh_primary, 1);
+    rtnl_route_nh_set_weight(nh_primary, 1);
+    rtnl_route_add_nexthop(route, nh_primary);
+    nl_addr_put(gw_primary);
+
+    // Inject the backup as if it had been parsed from FPM_RTA_BACKUP_NH
+    m_mockRouteSync.m_pendingBackupNexthops = {
+        { backup_gw, /*if_index=*/2, /*weight=*/1 },
+    };
+
+    // Mock getIfName calls
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet128", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(2, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet160", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    // Process the route
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+
+    // Verify route was added to APPL_DB
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_prefix, fvs));
+
+    // Verify all expected fields are present
+    string nexthops, ifnames, weights, primary_nh_count;
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "nexthop") {
+            nexthops = fvValue(fv);
+        } else if (fvField(fv) == "ifname") {
+            ifnames = fvValue(fv);
+        } else if (fvField(fv) == "weight") {
+            weights = fvValue(fv);
+        } else if (fvField(fv) == "primary_nh_count") {
+            primary_nh_count = fvValue(fv);
+        }
+    }
+
+    // Verify nexthops: both primary and backup should be present
+    EXPECT_EQ(nexthops, string(primary_gw) + "," + string(backup_gw));
+    EXPECT_EQ(ifnames, "Ethernet128,Ethernet160");
+    // Primary nexthop's raw weight 1 correctly becomes true weight 2; the
+    // backup nexthop's weight is already true weight (pre-converted), so it
+    // stays 1.
+    EXPECT_EQ(weights, "2,1");
+
+    // Verify primary_nh_count is set to 1 (only first nexthop is primary)
+    EXPECT_EQ(primary_nh_count, "1");
+
+    // Cleanup
+    rtnl_route_put(route);
+}
+
+TEST_F(FpmSyncdResponseTest, TestRouteWithMultiplePrimaryAndBackupNexthops)
+{
+    // Test route with 2 primary and 2 backup nexthops
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    const char* test_prefix = "10.5.0.0/24";
+
+    // Create a route with 2 primary nexthops in the libnl rtnl_route
+    rtnl_route* route = rtnl_route_alloc();
+    nl_addr* dst_addr;
+    nl_addr_parse(test_prefix, AF_INET, &dst_addr);
+    rtnl_route_set_dst(route, dst_addr);
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_table(route, RT_TABLE_MAIN);
+    nl_addr_put(dst_addr);
+
+    // Add 2 primary nexthops
+    for (int i = 0; i < 2; i++) {
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        nl_addr* gw;
+        string gw_str = "10.0.0." + to_string(i + 1);
+        nl_addr_parse(gw_str.c_str(), AF_INET, &gw);
+        rtnl_route_nh_set_gateway(nh, gw);
+        rtnl_route_nh_set_ifindex(nh, i + 1);
+        rtnl_route_nh_set_weight(nh, 1);
+        rtnl_route_add_nexthop(route, nh);
+        nl_addr_put(gw);
+    }
+
+    // Add 2 backup nexthops via the FPM_RTA_BACKUP_NH side channel
+    std::vector<RouteSync::BackupNexthop> backups;
+    for (int i = 0; i < 2; i++) {
+        backups.push_back({ "10.0.0." + to_string(i + 65),
+                            /*if_index=*/i + 3,
+                            /*weight=*/1 });
+    }
+    m_mockRouteSync.m_pendingBackupNexthops = std::move(backups);
+
+    // Mock getIfName calls
+    for (int i = 0; i < 4; i++) {
+        EXPECT_CALL(m_mockRouteSync, getIfName(i + 1, _, _))
+            .WillOnce(DoAll(
+                [i](int32_t, char* ifname, size_t size) {
+                    string if_str = "Ethernet" + to_string((i + 1) * 32);
+                    strncpy(ifname, if_str.c_str(), size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+    }
+
+    // Process the route
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+
+    // Verify route was added to APPL_DB
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_prefix, fvs));
+
+    // Verify all expected fields
+    string nexthops, ifnames, weights, primary_nh_count;
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "nexthop") {
+            nexthops = fvValue(fv);
+        } else if (fvField(fv) == "ifname") {
+            ifnames = fvValue(fv);
+        } else if (fvField(fv) == "weight") {
+            weights = fvValue(fv);
+        } else if (fvField(fv) == "primary_nh_count") {
+            primary_nh_count = fvValue(fv);
+        }
+    }
+
+    // Verify all 4 nexthops are present
+    EXPECT_EQ(nexthops, "10.0.0.1,10.0.0.2,10.0.0.65,10.0.0.66");
+    EXPECT_EQ(ifnames, "Ethernet32,Ethernet64,Ethernet96,Ethernet128");
+    // The 2 primary nexthops' raw weight 1 each correctly becomes true
+    // weight 2; the 2 backup nexthops' weights are already true weight
+    // (pre-converted), so they stay 1.
+    EXPECT_EQ(weights, "2,2,1,1");
+
+    // Verify primary_nh_count is set to 2 (first 2 nexthops are primary)
+    EXPECT_EQ(primary_nh_count, "2");
+
+    // Cleanup
+    rtnl_route_put(route);
+}
+
+TEST_F(FpmSyncdResponseTest, TestRouteWithoutBackupNexthop)
+{
+    // Test that routes without backup nexthops don't set primary_nh_count
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    const char* test_prefix = "10.6.0.0/24";
+    const char* primary_gw = "10.0.0.1";
+
+    // Create a route with only 1 primary nexthop (no backup)
+    rtnl_route* route = rtnl_route_alloc();
+    nl_addr* dst_addr;
+    nl_addr_parse(test_prefix, AF_INET, &dst_addr);
+    rtnl_route_set_dst(route, dst_addr);
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_table(route, RT_TABLE_MAIN);
+    nl_addr_put(dst_addr);
+
+    // Add only primary nexthop (no backup, no injection)
+    rtnl_nexthop* nh_primary = rtnl_route_nh_alloc();
+    nl_addr* gw_primary;
+    nl_addr_parse(primary_gw, AF_INET, &gw_primary);
+    rtnl_route_nh_set_gateway(nh_primary, gw_primary);
+    rtnl_route_nh_set_ifindex(nh_primary, 1);
+    rtnl_route_nh_set_weight(nh_primary, 1);
+    rtnl_route_add_nexthop(route, nh_primary);
+    nl_addr_put(gw_primary);
+
+    // Mock getIfName call
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet0", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    // Process the route
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+
+    // Verify route was added to APPL_DB
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_prefix, fvs));
+
+    // Verify fields
+    string nexthops, primary_nh_count;
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "nexthop") {
+            nexthops = fvValue(fv);
+        } else if (fvField(fv) == "primary_nh_count") {
+            primary_nh_count = fvValue(fv);
+        }
+    }
+
+    // Verify only one nexthop
+    EXPECT_EQ(nexthops, primary_gw);
+
+    // When there are no backup nexthops, primary_nh_count should be empty
+    // (the field is only set when backup nexthops are present)
+    EXPECT_TRUE(primary_nh_count.empty() || primary_nh_count == "1");
+
+    // Cleanup
+    rtnl_route_put(route);
+}
+
+/*
+ * Test the raw-attribute parser directly. Hand-build a minimal RTM_NEWROUTE
+ * netlink message with FPM_RTA_BACKUP_NH attached, feed it to
+ * setPendingBackupNexthopsFromRawMsg(), and verify the parser populates
+ * m_pendingBackupNexthops with the expected entries.
+ *
+ * Uses three backups so the test exercises the multi-rtnexthop walk inside
+ * a single FPM_RTA_BACKUP_NH attribute (the encoder packs multiple backups
+ * into one nest, not multiple attributes).
+ *
+ * Wire-format note: all three TestSetPendingBackupNexthopsFromRawMsg* tests
+ * below set NLA_F_NESTED (0x8000) on the FPM_RTA_BACKUP_NH rta_type, so
+ * the byte they hand to the parser matches what FRR's `nl_attr_nest()` (the
+ * helper our encoder uses) actually produces on the wire — `200 | 0x8000 =
+ * 32968`. An earlier revision of these tests used a bare 200 and missed a
+ * decoder bug where the rta_type compare didn't mask NLA_F_NESTED; that
+ * mismatch silently dropped every real backup nexthop reaching fpmsyncd.
+ * Keep the flag set here to guard against the regression.
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsg)
+{
+    // Layout:
+    //   nlmsghdr | rtmsg | FPM_RTA_BACKUP_NH { rtnh1, rtnh2, rtnh3 }
+    // where each rtnhN nests RTA_GATEWAY (ifindex carried in rtnh_ifindex).
+    auto build_rtnh = [](uint8_t *out, int ifindex, uint32_t gw_be,
+                         uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        rtnh->rtnh_hops = (uint8_t)(weight - 1);  // libnl-style weight = hops + 1
+
+        struct rtattr *gw = (struct rtattr *)(out + RTNH_ALIGN(sizeof(*rtnh)));
+        gw->rta_type = RTA_GATEWAY;
+        gw->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(gw), &gw_be, sizeof(uint32_t));
+
+        rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) + RTA_ALIGN(gw->rta_len));
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_dst_len = 24;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    // Build a single FPM_RTA_BACKUP_NH attribute carrying three rtnexthops
+    // back-to-back. If the decoder mistakenly stops after the first or second
+    // entry, the size assertion below catches it.
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    uint32_t gw1, gw2, gw3;
+    inet_pton(AF_INET, "10.0.0.65", &gw1);
+    inet_pton(AF_INET, "10.0.0.66", &gw2);
+    inet_pton(AF_INET, "10.0.0.67", &gw3);
+
+    uint16_t r1_len = build_rtnh(payload, /*ifindex=*/3, gw1, /*weight=*/1);
+    uint16_t off2 = RTNH_ALIGN(r1_len);
+    uint16_t r2_len = build_rtnh(payload + off2, /*ifindex=*/4, gw2, /*weight=*/2);
+    uint16_t off3 = (uint16_t)(off2 + RTNH_ALIGN(r2_len));
+    uint16_t r3_len = build_rtnh(payload + off3, /*ifindex=*/5, gw3, /*weight=*/1);
+    uint16_t payload_len = (uint16_t)(off3 + RTNH_ALIGN(r3_len));
+
+    backup_rta->rta_len = (uint16_t)(RTA_LENGTH(payload_len));
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    // Drive the parser.
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 3u)
+        << "parser must walk all rtnexthops inside a single FPM_RTA_BACKUP_NH";
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "10.0.0.65");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 3);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].weight, 1);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].gw, "10.0.0.66");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].if_index, 4);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].weight, 2);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[2].gw, "10.0.0.67");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[2].if_index, 5);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[2].weight, 1);
+
+    // The setter clears at the top of every call, so a subsequent message
+    // without FPM_RTA_BACKUP_NH must leave the channel empty (one-shot scope).
+    uint8_t buf2[256] = {0};
+    struct nlmsghdr *nlh2 = (struct nlmsghdr *)buf2;
+    nlh2->nlmsg_type = RTM_NEWROUTE;
+    nlh2->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    struct rtmsg *rtm2 = (struct rtmsg *)NLMSG_DATA(nlh2);
+    rtm2->rtm_family = AF_INET;
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh2);
+    EXPECT_TRUE(m_mockRouteSync.m_pendingBackupNexthops.empty());
+
+    // Non-route message types must be rejected outright. Pre-seed the side
+    // channel via injection and verify the parser clears it for non-routes.
+    nlh2->nlmsg_type = RTM_NEWLINK;
+    m_mockRouteSync.m_pendingBackupNexthops = {{ "1.2.3.4", 1, 1 }};
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh2);
+    EXPECT_TRUE(m_mockRouteSync.m_pendingBackupNexthops.empty());
+}
+
+/*
+ * Truncated RTA_GATEWAY payload: the parser must NOT call inet_ntop on a
+ * payload smaller than the address family's required size, otherwise the
+ * read goes past the RTA. Hand-build an rtnexthop with rta_len shrunk to
+ * 2 bytes (below the 4 needed for an IPv4 address) and verify the parser
+ * falls back to the family default ("0.0.0.0") instead of reading garbage.
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsgTruncatedGateway)
+{
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_dst_len = 32;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    /* Build one rtnexthop with a deliberately short RTA_GATEWAY. */
+    struct rtnexthop *rtnh = (struct rtnexthop *)payload;
+    memset(rtnh, 0, sizeof(*rtnh));
+    rtnh->rtnh_ifindex = 5;
+    rtnh->rtnh_hops = 0;
+
+    struct rtattr *gw = (struct rtattr *)(payload + RTNH_ALIGN(sizeof(*rtnh)));
+    gw->rta_type = RTA_GATEWAY;
+    /* Truncated: claim 2 bytes of payload (need 4 for AF_INET). */
+    gw->rta_len = (uint16_t)(sizeof(struct rtattr) + 2);
+    /* Don't even bother filling in real bytes — the parser must never read
+     * them. The buffer is zero-initialized, so reading would return 0s,
+     * but the contract is "don't read at all when too short." */
+
+    rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) + RTA_ALIGN(gw->rta_len));
+    backup_rta->rta_len = (uint16_t)RTA_LENGTH(RTNH_ALIGN(rtnh->rtnh_len));
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 1u);
+    /* Family default rather than whatever inet_ntop would have produced
+     * from out-of-bounds bytes. */
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "0.0.0.0");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 5);
+}
+
+/*
+ * Mixed-size rtnexthop walk: a backup with an explicit RTA_GATEWAY (larger
+ * rtnh_len) followed by an interface-only backup with no RTA_GATEWAY
+ * (smaller rtnh_len = sizeof(rtnexthop)). The two entries have different
+ * `rtnh_len` values — the exact shape that would expose a loop-iterator
+ * bug where `len` is decremented using the wrong entry's length (e.g.
+ * reading rtnh_len off the already-advanced pointer). Equal-size walks
+ * mask such bugs because the arithmetic comes out the same either way.
+ *
+ * The gatewayless entry exercises the parser's "no RTA_GATEWAY → family
+ * default" fallback (here AF_INET → "0.0.0.0").
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsgMixedSizes)
+{
+    auto build_rtnh_with_gw = [](uint8_t *out, int ifindex, uint32_t gw_be,
+                                 uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        rtnh->rtnh_hops = (uint8_t)(weight - 1);
+
+        struct rtattr *gw = (struct rtattr *)(out + RTNH_ALIGN(sizeof(*rtnh)));
+        gw->rta_type = RTA_GATEWAY;
+        gw->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(gw), &gw_be, sizeof(uint32_t));
+
+        rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) + RTA_ALIGN(gw->rta_len));
+        return rtnh->rtnh_len;
+    };
+
+    auto build_rtnh_no_gw = [](uint8_t *out, int ifindex,
+                               uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        rtnh->rtnh_hops = (uint8_t)(weight - 1);
+        rtnh->rtnh_len = (uint16_t)RTNH_ALIGN(sizeof(*rtnh));
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_dst_len = 24;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    /* Entry 1: full rtnh + RTA_GATEWAY. Larger rtnh_len. */
+    uint32_t gw1;
+    inet_pton(AF_INET, "10.0.0.65", &gw1);
+    uint16_t r1_len = build_rtnh_with_gw(payload, /*ifindex=*/3, gw1, /*weight=*/1);
+
+    /* Entry 2: bare rtnh, no nested attributes. Smaller rtnh_len. A
+     * wrong-order iterator that reads the next entry's rtnh_len would
+     * either over-decrement (loop terminates early on the next pass)
+     * or under-decrement (looping into garbage / OOB read). */
+    uint16_t off2 = RTNH_ALIGN(r1_len);
+    uint16_t r2_len = build_rtnh_no_gw(payload + off2, /*ifindex=*/4, /*weight=*/2);
+
+    uint16_t payload_len = (uint16_t)(off2 + RTNH_ALIGN(r2_len));
+    backup_rta->rta_len = (uint16_t)(RTA_LENGTH(payload_len));
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    /* Sanity: rtnh_len values must actually differ for this test to be
+     * meaningful — equal sizes mask the iterator bug. */
+    ASSERT_NE(RTNH_ALIGN(r1_len), RTNH_ALIGN(r2_len))
+        << "test setup error: rtnh_len values must differ";
+
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 2u)
+        << "parser must walk both entries despite mixed rtnh_len";
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "10.0.0.65");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 3);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].weight, 1);
+    /* Entry 2 had no RTA_GATEWAY — parser falls back to family default. */
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].gw, "0.0.0.0");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].if_index, 4);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].weight, 2);
+}
+
+/*
+ * RFC 5549 backup path (the remaining NOS-8818 product work): an IPv6
+ * nexthop on an IPv4 route is encoded by dplane_fpm_sonic.c's
+ * fpm_route_build_rtnh() as a cross-family RTA_VIA {AF_INET6, <v6 addr>}
+ * rather than RTA_GATEWAY, because an IPv4 route's RTA_GATEWAY can only hold
+ * 4 bytes. The decoder must read the family embedded in RTA_VIA and recover
+ * the full IPv6 address instead of truncating it to the route's (IPv4)
+ * family. This guards that encode/decode contract end-to-end on the wire.
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsgVia)
+{
+    // rtnexthop nesting a single RTA_VIA {uint16 family, addr[]}.
+    auto build_rtnh_via = [](uint8_t *out, int ifindex, uint16_t via_family,
+                             const void *addr, size_t addr_len,
+                             uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        rtnh->rtnh_hops = (uint8_t)(weight - 1);
+
+        struct rtattr *via =
+            (struct rtattr *)(out + RTNH_ALIGN(sizeof(*rtnh)));
+        via->rta_type = RTA_VIA;
+        via->rta_len = (uint16_t)RTA_LENGTH(sizeof(uint16_t) + addr_len);
+        uint8_t *vp = (uint8_t *)RTA_DATA(via);
+        memcpy(vp, &via_family, sizeof(uint16_t));
+        memcpy(vp + sizeof(uint16_t), addr, addr_len);
+
+        rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) +
+                                    RTA_ALIGN(via->rta_len));
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;  // IPv4 route ...
+    rtm->rtm_dst_len = 24;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    // ... reachable via an IPv6 backup nexthop carried in RTA_VIA.
+    struct in6_addr v6;
+    inet_pton(AF_INET6, "fc00::2", &v6);
+
+    uint16_t r1_len = build_rtnh_via(payload, /*ifindex=*/7, AF_INET6, &v6,
+                                     sizeof(v6), /*weight=*/1);
+    uint16_t payload_len = RTNH_ALIGN(r1_len);
+
+    backup_rta->rta_len = (uint16_t)RTA_LENGTH(payload_len);
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 1u);
+    // Full IPv6 address recovered from RTA_VIA, NOT a 4-byte truncation of
+    // the v6 bytes read as an IPv4 RTA_GATEWAY.
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "fc00::2");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 7);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].weight, 1);
+}
+
+/*
+ * Defensive counterpart to TestSetPendingBackupNexthopsFromRawMsgVia: the
+ * RTA_VIA decode has two reject conditions — an address family it cannot
+ * format, and a payload too short for the family it claims. Neither is
+ * producible by today's fpm_route_build_rtnh(), which is exactly why they
+ * need coverage: the guards exist so a future encoder change (or a corrupt
+ * message) degrades to the family default instead of letting inet_ntop()
+ * read past the attribute.
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsgViaMalformed)
+{
+    /* addr_len is passed explicitly so a payload can be made shorter than
+     * the claimed family requires. */
+    auto build_rtnh_via = [](uint8_t *out, int ifindex, uint16_t via_family,
+                             const void *addr, size_t addr_len,
+                             uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        rtnh->rtnh_hops = (uint8_t)(weight - 1);
+
+        struct rtattr *via =
+            (struct rtattr *)(out + RTNH_ALIGN(sizeof(*rtnh)));
+        via->rta_type = RTA_VIA;
+        via->rta_len = (uint16_t)RTA_LENGTH(sizeof(uint16_t) + addr_len);
+        uint8_t *vp = (uint8_t *)RTA_DATA(via);
+        memcpy(vp, &via_family, sizeof(uint16_t));
+        memcpy(vp + sizeof(uint16_t), addr, addr_len);
+
+        rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) +
+                                    RTA_ALIGN(via->rta_len));
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_dst_len = 24;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    /* Entry 1: unknown address family, otherwise well-formed. */
+    struct in6_addr v6;
+    inet_pton(AF_INET6, "fc00::2", &v6);
+    uint16_t r1_len = build_rtnh_via(payload, /*ifindex=*/7,
+                                     /*via_family=*/0xff, &v6, sizeof(v6),
+                                     /*weight=*/1);
+
+    /* Entry 2: family claims AF_INET but carries 1 byte, not 4. Payload is
+     * still >= sizeof(rtvia_family), so the decode is entered and must be
+     * rejected on the address-length check rather than the outer guard. */
+    const uint8_t stub_addr = 0x0a;
+    uint16_t off2 = RTNH_ALIGN(r1_len);
+    uint16_t r2_len = build_rtnh_via(payload + off2, /*ifindex=*/8, AF_INET,
+                                     &stub_addr, sizeof(stub_addr),
+                                     /*weight=*/2);
+
+    uint16_t payload_len = (uint16_t)(off2 + RTNH_ALIGN(r2_len));
+    backup_rta->rta_len = (uint16_t)RTA_LENGTH(payload_len);
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    /* Both entries are still parsed and kept — a malformed gateway degrades
+     * the address, it does not drop the nexthop. */
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 2u);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "0.0.0.0");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 7);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].gw, "0.0.0.0");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].if_index, 8);
+}
+
+/*
+ * SRv6-tunnel backup: a backup rtnexthop inside FPM_RTA_BACKUP_NH carries a
+ * nested RTA_ENCAP_TYPE=SRv6 + RTA_ENCAP { SRC_ADDR, SIDS[], NUM_SIDS } block,
+ * exactly as fpm_route_build_rtnh() in dplane_fpm_sonic.c emits it. Verify the
+ * parser lands the SID list on BackupNexthop.segment_list and captures the
+ * shared encap source. A second, plain-IP backup confirms the SRv6 block is
+ * skipped (empty segment_list) for non-tunnel backups.
+ *
+ * The encap attribute numbers below mirror the wire-format contract kept in
+ * lockstep between the decoder's ROUTE_ENCAP_SRV6_* enum (routesync.cpp) and
+ * the encoder's FPM_ROUTE_ENCAP_SRV6_* enum (dplane_fpm_sonic.c).
+ */
+TEST_F(FpmSyncdResponseTest, TestSetPendingBackupNexthopsFromRawMsgSrv6)
+{
+    enum {
+        SRV6_ENCAP_TYPE     = 101,  // RTA_ENCAP_TYPE value: NH_ENCAP_SRV6_ROUTE
+        ENCAP_SRV6_SIDS     = 1,
+        ENCAP_SRV6_SRC_ADDR = 2,
+        ENCAP_SRV6_NUM_SIDS = 8,
+    };
+
+    // rtnexthop with RTA_GATEWAY (underlay) + RTA_ENCAP_TYPE(SRv6) +
+    // nested RTA_ENCAP { SRC_ADDR, SIDS[], NUM_SIDS }.
+    auto build_srv6_rtnh = [&](uint8_t *out, int ifindex, uint32_t gw_be,
+                               const std::vector<struct in6_addr> &sids,
+                               const struct in6_addr &src) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+
+        uint8_t *p = out + RTNH_ALIGN(sizeof(*rtnh));
+
+        struct rtattr *gw = (struct rtattr *)p;
+        gw->rta_type = RTA_GATEWAY;
+        gw->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(gw), &gw_be, sizeof(uint32_t));
+        p += RTA_ALIGN(gw->rta_len);
+
+        struct rtattr *etype = (struct rtattr *)p;
+        etype->rta_type = RTA_ENCAP_TYPE;
+        etype->rta_len = RTA_LENGTH(sizeof(uint16_t));
+        uint16_t et = SRV6_ENCAP_TYPE;
+        memcpy(RTA_DATA(etype), &et, sizeof(uint16_t));
+        p += RTA_ALIGN(etype->rta_len);
+
+        // FRR sets NLA_F_NESTED on RTA_ENCAP; netlink_parse_rtattr masks it.
+        struct rtattr *encap = (struct rtattr *)p;
+        encap->rta_type = RTA_ENCAP | NLA_F_NESTED;
+        uint8_t *np = (uint8_t *)RTA_DATA(encap);
+
+        struct rtattr *src_a = (struct rtattr *)np;
+        src_a->rta_type = ENCAP_SRV6_SRC_ADDR;
+        src_a->rta_len = RTA_LENGTH(sizeof(struct in6_addr));
+        memcpy(RTA_DATA(src_a), &src, sizeof(struct in6_addr));
+        np += RTA_ALIGN(src_a->rta_len);
+
+        struct rtattr *sid_a = (struct rtattr *)np;
+        sid_a->rta_type = ENCAP_SRV6_SIDS;
+        sid_a->rta_len = (unsigned short)RTA_LENGTH(sids.size() * sizeof(struct in6_addr));
+        for (size_t i = 0; i < sids.size(); i++)
+            memcpy((uint8_t *)RTA_DATA(sid_a) + i * sizeof(struct in6_addr),
+                   &sids[i], sizeof(struct in6_addr));
+        np += RTA_ALIGN(sid_a->rta_len);
+
+        struct rtattr *num_a = (struct rtattr *)np;
+        num_a->rta_type = ENCAP_SRV6_NUM_SIDS;
+        num_a->rta_len = RTA_LENGTH(sizeof(uint8_t));
+        *(uint8_t *)RTA_DATA(num_a) = (uint8_t)sids.size();
+        np += RTA_ALIGN(num_a->rta_len);
+
+        encap->rta_len = (uint16_t)(np - (uint8_t *)encap);
+        p += RTA_ALIGN(encap->rta_len);
+
+        rtnh->rtnh_len = (uint16_t)(p - out);
+        return rtnh->rtnh_len;
+    };
+
+    auto build_plain_rtnh = [](uint8_t *out, int ifindex, uint32_t gw_be) -> uint16_t {
+        struct rtnexthop *rtnh = (struct rtnexthop *)out;
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = ifindex;
+        struct rtattr *gw = (struct rtattr *)(out + RTNH_ALIGN(sizeof(*rtnh)));
+        gw->rta_type = RTA_GATEWAY;
+        gw->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        memcpy(RTA_DATA(gw), &gw_be, sizeof(uint32_t));
+        rtnh->rtnh_len = (uint16_t)(RTNH_ALIGN(sizeof(*rtnh)) + RTA_ALIGN(gw->rta_len));
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    nlh->nlmsg_type = RTM_NEWROUTE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    memset(rtm, 0, sizeof(*rtm));
+    rtm->rtm_family = AF_INET;
+    rtm->rtm_dst_len = 24;
+    rtm->rtm_protocol = RTPROT_STATIC;
+
+    uint8_t *attr_pos = buf + NLMSG_ALIGN(nlh->nlmsg_len);
+    struct rtattr *backup_rta = (struct rtattr *)attr_pos;
+    backup_rta->rta_type = FPM_RTA_BACKUP_NH | NLA_F_NESTED;
+    uint8_t *payload = (uint8_t *)RTA_DATA(backup_rta);
+
+    uint32_t gw0, gw1;
+    inet_pton(AF_INET, "10.0.0.65", &gw0);
+    inet_pton(AF_INET, "10.0.0.66", &gw1);
+
+    struct in6_addr sid0, src6;
+    inet_pton(AF_INET6, "fc00:0:1::", &sid0);
+    inet_pton(AF_INET6, "2001:db8::1", &src6);
+
+    uint16_t r0 = build_srv6_rtnh(payload, /*ifindex=*/3, gw0, { sid0 }, src6);
+    uint16_t off1 = RTNH_ALIGN(r0);
+    uint16_t r1 = build_plain_rtnh(payload + off1, /*ifindex=*/4, gw1);
+    uint16_t payload_len = (uint16_t)(off1 + RTNH_ALIGN(r1));
+
+    backup_rta->rta_len = (uint16_t)RTA_LENGTH(payload_len);
+    nlh->nlmsg_len = (uint32_t)(NLMSG_ALIGN(nlh->nlmsg_len) +
+                                RTA_ALIGN(backup_rta->rta_len));
+
+    m_mockRouteSync.setPendingBackupNexthopsFromRawMsg(nlh);
+
+    ASSERT_EQ(m_mockRouteSync.m_pendingBackupNexthops.size(), 2u);
+
+    // Backup 0: SRv6 tunnel - underlay gateway + decoded SID list.
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].gw, "10.0.0.65");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].if_index, 3);
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[0].segment_list, "fc00:0:1::");
+
+    // Backup 1: plain IP - no SID list.
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].gw, "10.0.0.66");
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupNexthops[1].if_index, 4);
+    EXPECT_TRUE(m_mockRouteSync.m_pendingBackupNexthops[1].segment_list.empty());
+
+    // Shared encap source captured once from the SRv6 backup.
+    EXPECT_EQ(m_mockRouteSync.m_pendingBackupSegSource, "2001:db8::1");
+}
+
+TEST_F(FpmSyncdResponseTest, TestSrv6SteerMultipathKeepsOverlayEndpointAndWeight)
+{
+    enum {
+        SRV6_ENCAP_TYPE     = 101,
+        ENCAP_SRV6_SIDS     = 1,
+        ENCAP_SRV6_SRC_ADDR = 2,
+        ENCAP_SRV6_NUM_SIDS = 8,
+    };
+
+    auto build_rtnh = [&](uint8_t *out, const char *endpoint,
+                          const char *sid, const char *src,
+                          uint8_t weight) -> uint16_t {
+        struct rtnexthop *rtnh = reinterpret_cast<struct rtnexthop *>(out);
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_hops = weight - 1;
+        uint8_t *p = out + RTNH_ALIGN(sizeof(*rtnh));
+
+        struct in6_addr endpoint6, sid6, src6;
+        inet_pton(AF_INET6, endpoint, &endpoint6);
+        inet_pton(AF_INET6, sid, &sid6);
+        inet_pton(AF_INET6, src, &src6);
+
+        struct rtattr *gw = reinterpret_cast<struct rtattr *>(p);
+        gw->rta_type = RTA_GATEWAY;
+        gw->rta_len = RTA_LENGTH(sizeof(endpoint6));
+        memcpy(RTA_DATA(gw), &endpoint6, sizeof(endpoint6));
+        p += RTA_ALIGN(gw->rta_len);
+
+        struct rtattr *etype = reinterpret_cast<struct rtattr *>(p);
+        etype->rta_type = RTA_ENCAP_TYPE;
+        etype->rta_len = RTA_LENGTH(sizeof(uint16_t));
+        *reinterpret_cast<uint16_t *>(RTA_DATA(etype)) = SRV6_ENCAP_TYPE;
+        p += RTA_ALIGN(etype->rta_len);
+
+        struct rtattr *encap = reinterpret_cast<struct rtattr *>(p);
+        encap->rta_type = RTA_ENCAP | NLA_F_NESTED;
+        uint8_t *np = reinterpret_cast<uint8_t *>(RTA_DATA(encap));
+
+        struct rtattr *src_a = reinterpret_cast<struct rtattr *>(np);
+        src_a->rta_type = ENCAP_SRV6_SRC_ADDR;
+        src_a->rta_len = RTA_LENGTH(sizeof(src6));
+        memcpy(RTA_DATA(src_a), &src6, sizeof(src6));
+        np += RTA_ALIGN(src_a->rta_len);
+
+        struct rtattr *sid_a = reinterpret_cast<struct rtattr *>(np);
+        sid_a->rta_type = ENCAP_SRV6_SIDS;
+        sid_a->rta_len = RTA_LENGTH(sizeof(sid6));
+        memcpy(RTA_DATA(sid_a), &sid6, sizeof(sid6));
+        np += RTA_ALIGN(sid_a->rta_len);
+
+        struct rtattr *num_a = reinterpret_cast<struct rtattr *>(np);
+        num_a->rta_type = ENCAP_SRV6_NUM_SIDS;
+        num_a->rta_len = RTA_LENGTH(sizeof(uint8_t));
+        *reinterpret_cast<uint8_t *>(RTA_DATA(num_a)) = 1;
+        np += RTA_ALIGN(num_a->rta_len);
+
+        encap->rta_len = static_cast<uint16_t>(np -
+                                               reinterpret_cast<uint8_t *>(encap));
+        p += RTA_ALIGN(encap->rta_len);
+        rtnh->rtnh_len = static_cast<uint16_t>(p - out);
+        return rtnh->rtnh_len;
+    };
+
+    uint8_t buf[1024] = {0};
+    struct rtattr *mp = reinterpret_cast<struct rtattr *>(buf);
+    uint8_t *payload = reinterpret_cast<uint8_t *>(RTA_DATA(mp));
+    uint16_t r0 = build_rtnh(payload, "2064:100::1", "fc00::a",
+                             "fc00::5", 80);
+    uint16_t off1 = RTNH_ALIGN(r0);
+    uint16_t r1 = build_rtnh(payload + off1, "2064:100::1", "fc00::2",
+                             "fc00::5", 20);
+    mp->rta_type = RTA_MULTIPATH;
+    mp->rta_len = static_cast<unsigned short>(RTA_LENGTH(off1 + RTNH_ALIGN(r1)));
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    tb[RTA_MULTIPATH] = mp;
+    struct nlmsghdr nlh = {};
+    nlh.nlmsg_type = RTM_NEWROUTE;
+    string segments, sources, nexthops, weights;
+
+    ASSERT_TRUE(m_mockRouteSync.getSrv6SteerRouteNextHop(
+        &nlh, sizeof(buf), tb, segments, sources, nexthops, weights));
+    EXPECT_EQ(segments, "fc00::a,fc00::2");
+    EXPECT_EQ(sources, "fc00::5,fc00::5");
+    EXPECT_EQ(nexthops, "2064:100::1,2064:100::1");
+    EXPECT_EQ(weights, "80,20");
+}
+
+/*
+ * Row-level: a plain primary plus an SRv6-tunnel backup. The backup's SID list
+ * (segment_list) and the shared encap source (m_pendingBackupSegSource) are
+ * injected as the parser would set them. Verify ROUTE_TABLE carries segment /
+ * seg_src vectors index-aligned with nexthop ("na" filler for the plain
+ * primary, split at primary_nh_count), and that the backup SID list is
+ * programmed into SRV6_SID_LIST_TABLE.
+ */
+TEST_F(FpmSyncdResponseTest, TestRouteWithSrv6BackupNexthop)
+{
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+    Table sidlist_table(m_db.get(), APP_SRV6_SID_LIST_TABLE_NAME);
+
+    const char* test_prefix = "10.5.0.0/24";
+    const char* primary_gw = "10.0.0.1";
+    const char* backup_gw = "10.0.0.65";   // underlay nexthop of the tunnel
+    const char* backup_sid = "fc00:0:1::";
+    const char* seg_src = "2001:db8::1";
+
+    rtnl_route* route = rtnl_route_alloc();
+    nl_addr* dst_addr;
+    nl_addr_parse(test_prefix, AF_INET, &dst_addr);
+    rtnl_route_set_dst(route, dst_addr);
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_table(route, RT_TABLE_MAIN);
+    nl_addr_put(dst_addr);
+
+    rtnl_nexthop* nh_primary = rtnl_route_nh_alloc();
+    nl_addr* gw_primary;
+    nl_addr_parse(primary_gw, AF_INET, &gw_primary);
+    rtnl_route_nh_set_gateway(nh_primary, gw_primary);
+    rtnl_route_nh_set_ifindex(nh_primary, 1);
+    rtnl_route_nh_set_weight(nh_primary, 1);
+    rtnl_route_add_nexthop(route, nh_primary);
+    nl_addr_put(gw_primary);
+
+    // Inject the SRv6 backup as the parser would: gw, if_index, weight,
+    // segment_list, plus the route-level shared encap source.
+    m_mockRouteSync.m_pendingBackupNexthops = {
+        { backup_gw, /*if_index=*/2, /*weight=*/1, backup_sid },
+    };
+    m_mockRouteSync.m_pendingBackupSegSource = seg_src;
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet128", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)));
+    EXPECT_CALL(m_mockRouteSync, getIfName(2, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet160", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)));
+
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+
+    vector<FieldValueTuple> fvs;
+    ASSERT_TRUE(route_table.get(test_prefix, fvs));
+
+    string nexthops, segment, segsrc, primary_nh_count;
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "nexthop") nexthops = fvValue(fv);
+        else if (fvField(fv) == "segment") segment = fvValue(fv);
+        else if (fvField(fv) == "seg_src") segsrc = fvValue(fv);
+        else if (fvField(fv) == "primary_nh_count") primary_nh_count = fvValue(fv);
+    }
+
+    EXPECT_EQ(nexthops, string(primary_gw) + "," + string(backup_gw));
+    // "na" filler for the plain primary slot; SID list / source for the backup.
+    EXPECT_EQ(segment, string("na,") + backup_sid);
+    EXPECT_EQ(segsrc, string("na,") + seg_src);
+    EXPECT_EQ(primary_nh_count, "1");
+
+    // Backup SID list programmed into SRV6_SID_LIST_TABLE: key is the
+    // pipe-joined name, path is the comma-joined SID stack (single SID here).
+    vector<FieldValueTuple> sidfvs;
+    ASSERT_TRUE(sidlist_table.get(backup_sid, sidfvs));
+    string path;
+    for (const auto& fv : sidfvs)
+        if (fvField(fv) == "path") path = fvValue(fv);
+    EXPECT_EQ(path, backup_sid);
+
+    rtnl_route_put(route);
+}
+
+/*
+ * Deleting a route that owns a backup SRv6 SID list releases the SID list:
+ * the SRV6_SID_LIST_TABLE entry is removed and both tracking structures
+ * (refcount map, owning-prefix set) are cleared.
+ */
+TEST_F(FpmSyncdResponseTest, TestRouteWithSrv6BackupNexthopDelete)
+{
+    Table sidlist_table(m_db.get(), APP_SRV6_SID_LIST_TABLE_NAME);
+    const char* test_prefix = "10.6.0.0/24";
+    const char* backup_sid = "fc00:0:1::";
+
+    mockGetIfNameAny();
+    sendSrv6BackupRoute(test_prefix, "10.0.0.1", "10.0.0.65", backup_sid, "2001:db8::1");
+
+    /* Precondition: SID list programmed and tracked. */
+    vector<FieldValueTuple> sidfvs;
+    ASSERT_TRUE(sidlist_table.get(backup_sid, sidfvs));
+    EXPECT_EQ(m_mockRouteSync.m_srv6_sidlist_refcnt[backup_sid], 1u);
+    EXPECT_EQ(m_mockRouteSync.m_routesWithBackupSidLists.count(test_prefix), 1u);
+
+    delRoute(test_prefix, "10.0.0.1");
+
+    EXPECT_FALSE(sidlist_table.get(backup_sid, sidfvs));
+    EXPECT_EQ(m_mockRouteSync.m_srv6_sidlist_refcnt.count(backup_sid), 0u);
+    EXPECT_EQ(m_mockRouteSync.m_routesWithBackupSidLists.count(test_prefix), 0u);
+}
+
+/*
+ * Re-advertising the same route with the same backup SID list (a no-op update)
+ * keeps the refcount at 1 and leaves the SRV6_SID_LIST_TABLE entry in place:
+ * the new ref is taken before the prior ref is released, so the SID list never
+ * churns to zero.
+ */
+TEST_F(FpmSyncdResponseTest, TestRouteWithSrv6BackupNexthopUpdateSameSidList)
+{
+    Table sidlist_table(m_db.get(), APP_SRV6_SID_LIST_TABLE_NAME);
+    const char* test_prefix = "10.7.0.0/24";
+    const char* backup_sid = "fc00:0:1::";
+
+    mockGetIfNameAny();
+    sendSrv6BackupRoute(test_prefix, "10.0.0.1", "10.0.0.65", backup_sid, "2001:db8::1");
+    sendSrv6BackupRoute(test_prefix, "10.0.0.1", "10.0.0.65", backup_sid, "2001:db8::1");
+
+    vector<FieldValueTuple> sidfvs;
+    EXPECT_TRUE(sidlist_table.get(backup_sid, sidfvs));
+    EXPECT_EQ(m_mockRouteSync.m_srv6_sidlist_refcnt[backup_sid], 1u);
+    EXPECT_EQ(m_mockRouteSync.m_routesWithBackupSidLists.count(test_prefix), 1u);
+}
+
+/*
+ * Swapping the backup SID list on an existing route (BGP recomputes a backup to
+ * a different tunnel) releases the old SID list and programs the new one: the
+ * old SRV6_SID_LIST_TABLE entry is removed and only the new one remains.
+ */
+TEST_F(FpmSyncdResponseTest, TestRouteWithSrv6BackupNexthopUpdateSwapSidList)
+{
+    Table sidlist_table(m_db.get(), APP_SRV6_SID_LIST_TABLE_NAME);
+    const char* test_prefix = "10.8.0.0/24";
+    const char* backup_sid1 = "fc00:0:1::";
+    const char* backup_sid2 = "fc00:0:2::";
+
+    mockGetIfNameAny();
+    sendSrv6BackupRoute(test_prefix, "10.0.0.1", "10.0.0.65", backup_sid1, "2001:db8::1");
+    sendSrv6BackupRoute(test_prefix, "10.0.0.1", "10.0.0.65", backup_sid2, "2001:db8::1");
+
+    vector<FieldValueTuple> sidfvs;
+    EXPECT_FALSE(sidlist_table.get(backup_sid1, sidfvs));
+    EXPECT_EQ(m_mockRouteSync.m_srv6_sidlist_refcnt.count(backup_sid1), 0u);
+    EXPECT_TRUE(sidlist_table.get(backup_sid2, sidfvs));
+    EXPECT_EQ(m_mockRouteSync.m_srv6_sidlist_refcnt[backup_sid2], 1u);
+    EXPECT_EQ(m_mockRouteSync.m_routesWithBackupSidLists.count(test_prefix), 1u);
+}
+
+/*
+ * Modifying the backup set on an existing route (e.g. a peer goes down and
+ * BGP recomputes PIC backups) arrives at fpmsyncd as an UPDATE — either a
+ * single RTM_NEWROUTE with NLM_F_REPLACE or an RTM_DELROUTE+RTM_NEWROUTE
+ * pair, depending on the encoder's use_route_replace setting. In both
+ * cases the new RTM_NEWROUTE carries the full new state (primaries +
+ * FPM_RTA_BACKUP_NH backups), and fpmsyncd's setRouteWithWarmRestart
+ * overwrites the ROUTE_TABLE entry. Verify that pattern: drive the same
+ * prefix twice with two different backup sets and assert the final entry
+ * reflects the second message, not the first.
+ */
+TEST_F(FpmSyncdResponseTest, TestRouteUpdateReplacesBackupNexthops)
+{
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    const char* test_prefix = "10.9.0.0/24";
+    const char* primary_gw = "10.0.0.1";
+
+    auto build_primary_route = [&]() {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(test_prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, RT_TABLE_MAIN);
+        nl_addr_put(dst_addr);
+
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        nl_addr* gw;
+        nl_addr_parse(primary_gw, AF_INET, &gw);
+        rtnl_route_nh_set_gateway(nh, gw);
+        rtnl_route_nh_set_ifindex(nh, 1);
+        rtnl_route_nh_set_weight(nh, 1);
+        rtnl_route_add_nexthop(route, nh);
+        nl_addr_put(gw);
+        return route;
+    };
+
+    /* First UPDATE — route has 3 backups: 10.0.0.65/66/67. */
+    {
+        rtnl_route* route = build_primary_route();
+
+        std::vector<RouteSync::BackupNexthop> backups = {
+            { "10.0.0.65", /*if_index=*/2, 1 },
+            { "10.0.0.66", /*if_index=*/3, 1 },
+            { "10.0.0.67", /*if_index=*/4, 1 },
+        };
+        m_mockRouteSync.m_pendingBackupNexthops = std::move(backups);
+
+        /* getIfName called once per nexthop (1 primary + 3 backups). */
+        EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char* ifname, size_t size) {
+                    strncpy(ifname, "Ethernet0", size); ifname[size-1] = '\0';
+                },
+                Return(true)));
+        for (int i = 2; i <= 4; i++) {
+            EXPECT_CALL(m_mockRouteSync, getIfName(i, _, _))
+                .WillOnce(DoAll(
+                    [i](int32_t, char* ifname, size_t size) {
+                        std::string s = "Ethernet" + std::to_string(i * 8);
+                        strncpy(ifname, s.c_str(), size); ifname[size-1] = '\0';
+                    },
+                    Return(true)));
+        }
+
+        m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+        rtnl_route_put(route);
+    }
+
+    /* Verify intermediate state (3 backups) before driving the update. */
+    {
+        vector<FieldValueTuple> fvs;
+        EXPECT_TRUE(route_table.get(test_prefix, fvs));
+        string nexthops, primary_nh_count;
+        for (const auto& fv : fvs) {
+            if (fvField(fv) == "nexthop")          nexthops = fvValue(fv);
+            else if (fvField(fv) == "primary_nh_count") primary_nh_count = fvValue(fv);
+        }
+        EXPECT_EQ(nexthops, "10.0.0.1,10.0.0.65,10.0.0.66,10.0.0.67");
+        EXPECT_EQ(primary_nh_count, "1");
+    }
+
+    /* Second UPDATE — same prefix, but only ONE backup left
+     * (10.0.0.66; 65 and 67 dropped). This is the "BGP withdrew two
+     * backup paths" case. */
+    {
+        rtnl_route* route = build_primary_route();
+
+        std::vector<RouteSync::BackupNexthop> backups = {
+            { "10.0.0.66", /*if_index=*/3, 1 },
+        };
+        m_mockRouteSync.m_pendingBackupNexthops = std::move(backups);
+
+        EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char* ifname, size_t size) {
+                    strncpy(ifname, "Ethernet0", size); ifname[size-1] = '\0';
+                },
+                Return(true)));
+        EXPECT_CALL(m_mockRouteSync, getIfName(3, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char* ifname, size_t size) {
+                    strncpy(ifname, "Ethernet24", size); ifname[size-1] = '\0';
+                },
+                Return(true)));
+
+        m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route, nullptr);
+        rtnl_route_put(route);
+    }
+
+    /* Final state must reflect the second message: primary + 1 backup,
+     * with the dropped backups gone. ProducerStateTable.set() replaces
+     * the entry by key, so old fields don't linger. */
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_prefix, fvs));
+
+    string nexthops, ifnames, primary_nh_count;
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "nexthop")          nexthops = fvValue(fv);
+        else if (fvField(fv) == "ifname")      ifnames = fvValue(fv);
+        else if (fvField(fv) == "primary_nh_count") primary_nh_count = fvValue(fv);
+    }
+
+    EXPECT_EQ(nexthops, "10.0.0.1,10.0.0.66");
+    EXPECT_EQ(ifnames, "Ethernet0,Ethernet24");
+    EXPECT_EQ(primary_nh_count, "1");
+}
+
+>>>>>>> 88ab5d14 (NOS-13441: fpmsyncd: Fix off-by-one nexthop weight sent to APPL_DB (#983))
 // Test for VnetTunnelTableFieldValueTupleWrapper with ZMQ enabled (line 1127)
 TEST_F(FpmSyncdResponseTest, TestVxlanTunnelRouteMsgWithZmqEnabled)
 {
@@ -1539,6 +2723,26 @@ TEST_F(FpmSyncdResponseTest, TestGetNextHopWt)
     rtnl_route_add_nexthop(test_route.get(), nh2);
 
     EXPECT_EQ(m_mockRouteSync.getNextHopWt(test_route.get()), "1,1");
+}
+
+// Checks that a nonzero raw netlink weight (rtnh_hops, which encodes
+// true_weight - 1 per netlink convention) is converted back to the true
+// weight by adding 1, rather than being passed through unconverted.
+TEST_F(FpmSyncdResponseTest, TestGetNextHopWtNonZero)
+{
+    auto test_route = create_route("10.1.1.0");
+
+    // Raw netlink weights 126 and 254 should become true weights 127 and 255
+    rtnl_nexthop* nh1 = create_nexthop(test_gateway);
+    rtnl_route_nh_set_weight(nh1, 126);
+    rtnl_nexthop* nh2 = create_nexthop(test_gateway_);
+    rtnl_route_nh_set_weight(nh2, 254);
+
+    // Add new nexthops to the route
+    rtnl_route_add_nexthop(test_route.get(), nh1);
+    rtnl_route_add_nexthop(test_route.get(), nh2);
+
+    EXPECT_EQ(m_mockRouteSync.getNextHopWt(test_route.get()), "127,255");
 }
 
 class WarmRestartRouteSyncTest : public ::testing::Test
