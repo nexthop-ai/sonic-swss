@@ -545,7 +545,25 @@ void IntfMgr::updateSubIntfAdminStatus(const string &alias, const string &admin)
                 continue;
             }
             std::vector<FieldValueTuple> fvVector;
-            string subintf_admin = setHostSubIntfAdminStatus(intf, m_subIntfList[intf].adminStatus, admin);
+            string subintf_admin;
+            try
+            {
+                subintf_admin = setHostSubIntfAdminStatus(intf, m_subIntfList[intf].adminStatus, admin);
+            }
+            catch (const std::runtime_error &e)
+            {
+                /* The kernel can transiently refuse to bring a sub interface up
+                 * (ENETDOWN) while its parent netdev is not IFF_UP yet, e.g. right
+                 * after a cold swss restart when this state event races the parent's
+                 * own kernel admin-up. Keep the sub interface down; portsyncd emits a
+                 * fresh STATE_DB PORT_TABLE/LAG_TABLE admin_status event on every
+                 * parent netlink change, which retries this path. */
+                SWSS_LOG_WARN("Failed to set sub interface %s admin status to %s (parent %s): %s"
+                              " - deferring to next parent state event",
+                              intf.c_str(), m_subIntfList[intf].adminStatus.c_str(),
+                              alias.c_str(), e.what());
+                subintf_admin = "down";
+            }
             m_subIntfList[intf].currAdminStatus = subintf_admin;
             FieldValueTuple fvTuple("admin_status", subintf_admin);
             fvVector.push_back(fvTuple);
