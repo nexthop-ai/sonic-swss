@@ -16,9 +16,11 @@
 #include "recorder.h"
 #undef private
 
+#include "subscriberstatetable.h"
 #include "ut_helper.h"
 #include "mock_orchagent_main.h"
 #include "mock_table.h"
+#include "zmqorch.h"
 
 #include <chrono>
 #include <cstdio>
@@ -450,6 +452,224 @@ namespace consumer_test
                     { f3, v3a } } });
 
         validate_syncmap(consumer->m_toSync, 1, key, exp_kofv);
+    }
+
+    TEST_F(ConsumerTest, ConsumerFullSnapshotSourceFlag)
+    {
+        // Test case, m_fullSnapshotSource should be set only for consumers
+        // backed by SubscriberStateTable
+        Consumer sub_consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), "CFG_TEST_TABLE", 1, 1),
+            gPortsOrch, "CFG_TEST_TABLE");
+
+        ASSERT_TRUE(sub_consumer.m_fullSnapshotSource);
+        ASSERT_FALSE(consumer->m_fullSnapshotSource);
+    }
+
+    TEST_F(ConsumerTest, SubscriberAddToSync_SnapshotReplacesPendingSet)
+    {
+        // Test case, SET then SET without f2 and with a new value for f1 on a
+        // subscriber consumer, newer snapshot should replace the pending SET
+        // so f2 does not survive and f1 carries the new value
+        Consumer sub_consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), "CFG_TEST_TABLE", 1, 1),
+            gPortsOrch, "CFG_TEST_TABLE");
+
+        auto parked = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1a },
+                    { f2, v2a },
+                    { f3, v3a } } });
+
+        auto snapshot = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1b },
+                    { f3, v3a } } });
+
+        sub_consumer.addToSync(parked);
+        sub_consumer.addToSync(snapshot);
+
+        // expect the newer snapshot only, f2 should be gone
+        exp_kofv = snapshot;
+        validate_syncmap(sub_consumer.m_toSync, 1, key, exp_kofv);
+    }
+
+    TEST_F(ConsumerTest, SubscriberAddToSync_SnapshotAfterPendingDel)
+    {
+        // Test case, DEL then SET, SET on a subscriber consumer, order should
+        // be kept and the second SET should replace the first
+        Consumer sub_consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), "CFG_TEST_TABLE", 1, 1),
+            gPortsOrch, "CFG_TEST_TABLE");
+
+        auto entry_del = KeyOpFieldsValuesTuple(
+            { key,
+                DEL_COMMAND,
+                { { } } });
+
+        auto entry_set = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1a } } });
+
+        auto entry_set2 = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f3, v3a } } });
+
+        sub_consumer.addToSync(entry_del);
+        sub_consumer.addToSync(entry_set);
+        sub_consumer.addToSync(entry_set2);
+
+        // expect DEL then the newer SET
+        exp_kofv = entry_del;
+        validate_syncmap(sub_consumer.m_toSync, 2, key, exp_kofv);
+
+        exp_kofv = entry_set2;
+        validate_syncmap(sub_consumer.m_toSync, 1, key, exp_kofv);
+    }
+
+    TEST_F(ConsumerTest, SubscriberAddToSync_SnapshotReplacesRetryCachedSet)
+    {
+        // Test case, snapshot replace through the RetryCache path.
+        //
+        // When a SET for a key is sitting in the RetryCache (not in m_toSync)
+        // and a newer SET for that key arrives, addToSync() first evicts the
+        // cached SET back into m_toSync and then combines it with the newer
+        // SET. On a subscriber consumer that combine must be a replace: the
+        // newer snapshot wins as a whole, and f2 (present only in the cached
+        // SET) must be gone afterwards.
+        //
+        // Two cache shapes are covered: (1) only a SET is cached,
+        // (2) a DEL and a SET are cached together.
+        TestOrch orch(m_config_db.get(), "CFG_RETRY_TABLE");
+        orch.createRetryCache("CFG_RETRY_TABLE");
+        auto retryCache = orch.getRetryCache("CFG_RETRY_TABLE");
+        ASSERT_NE(retryCache, nullptr);
+
+        Consumer sub_consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), "CFG_RETRY_TABLE", 1, 1),
+            &orch, "CFG_RETRY_TABLE");
+        ASSERT_TRUE(sub_consumer.m_fullSnapshotSource);
+
+        auto parked = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1a },
+                    { f2, v2a },
+                    { f3, v3a } } });
+
+        auto snapshot = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1b },
+                    { f3, v3a } } });
+
+        // Shape 1: only a SET is cached. Expect the cache to be empty for the
+        // key and m_toSync to hold just the snapshot.
+        retryCache->insert(parked, DUMMY_CONSTRAINT);
+        sub_consumer.addToSync(snapshot);
+
+        ASSERT_EQ(retryCache->getRetryMap().count(key), 0);
+        exp_kofv = snapshot;
+        validate_syncmap(sub_consumer.m_toSync, 1, key, exp_kofv);
+
+        // Shape 2: a DEL and a SET are cached. Expect the DEL to stay cached,
+        // and m_toSync to hold just the snapshot (the evicted SET was
+        // replaced, not merged).
+        auto entry_del = KeyOpFieldsValuesTuple(
+            { key,
+                DEL_COMMAND,
+                { { } } });
+
+        retryCache->insert(entry_del, DUMMY_CONSTRAINT);
+        retryCache->insert(parked, DUMMY_CONSTRAINT);
+        sub_consumer.addToSync(snapshot);
+
+        ASSERT_EQ(retryCache->getRetryMap().count(key), 1);
+        ASSERT_EQ(kfvOp(retryCache->getRetryMap().find(key)->second.second), DEL_COMMAND);
+        exp_kofv = snapshot;
+        validate_syncmap(sub_consumer.m_toSync, 1, key, exp_kofv);
+    }
+
+    TEST_F(ConsumerTest, ZmqConsumerAddToSync_KeepsFieldMerge)
+    {
+        // Test case, ZMQ-backed consumers keep the old field-merge semantics.
+        //
+        // A ZmqConsumerStateTable delivers deltas, not full snapshots, so
+        // m_fullSnapshotSource must be false and SET over SET must still
+        // field-merge: f2, which only the older SET carries, must survive.
+        swss::ZmqServer zmq_server("tcp://127.0.0.1:18101", "");
+        ZmqConsumer zmq_consumer(
+            new swss::ZmqConsumerStateTable(m_app_db.get(), "APP_TEST_TABLE", zmq_server,
+                                            1, 1, /*dbPersistence=*/false),
+            gPortsOrch, "APP_TEST_TABLE");
+
+        ASSERT_FALSE(zmq_consumer.m_fullSnapshotSource);
+
+        auto entrya = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1a },
+                    { f2, v2a } } });
+
+        auto entryb = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1b },
+                    { f3, v3a } } });
+
+        zmq_consumer.addToSync(entrya);
+        zmq_consumer.addToSync(entryb);
+
+        // expect one merged SET: f2 kept from the older SET, f1 updated to
+        // the newer value, f3 appended (same field order as
+        // ConsumerAddToSync_Del_Set_Setnew1)
+        exp_kofv = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f2, v2a },
+                    { f1, v1b },
+                    { f3, v3a } } });
+        validate_syncmap(zmq_consumer.m_toSync, 1, key, exp_kofv);
+    }
+
+    TEST_F(ConsumerTest, SubscriberRefillToSync_SnapshotReplacesPendingSet)
+    {
+        // Test case, snapshot replace through the refillToSync path.
+        //
+        // refillToSync() (used by warm restart and addExistingData) reads
+        // whole entries from the table and feeds them through addToSync().
+        // On a subscriber consumer the entry read from the table must
+        // replace a SET already pending for the same key, not merge into it:
+        // f2, present only in the pending SET, must be gone afterwards.
+        Consumer sub_consumer(
+            new swss::SubscriberStateTable(m_config_db.get(), "CFG_TEST_TABLE", 1, 1),
+            gPortsOrch, "CFG_TEST_TABLE");
+
+        auto parked = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1a },
+                    { f2, v2a },
+                    { f3, v3a } } });
+        sub_consumer.addToSync(parked);
+
+        // The table holds the entry without f2 and with a newer f1 value
+        swss::Table table(m_config_db.get(), "CFG_TEST_TABLE");
+        table.set(key, { { f1, v1b }, { f3, v3a } });
+
+        ASSERT_EQ(sub_consumer.refillToSync(&table), 1);
+
+        // expect the table snapshot only, f2 should be gone
+        exp_kofv = KeyOpFieldsValuesTuple(
+            { key,
+                SET_COMMAND,
+                { { f1, v1b },
+                    { f3, v3a } } });
+        validate_syncmap(sub_consumer.m_toSync, 1, key, exp_kofv);
     }
 
     TEST_F(ConsumerTest, ConsumerAddToSync_Ind_Set_Del)

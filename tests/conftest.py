@@ -751,6 +751,45 @@ class DockerVirtualSwitch:
 
         return marker
 
+    def wait_for_log(
+        self,
+        marker: str,
+        pattern: str,
+        expected_cnt: int = 1,
+        polling_config: PollingConfig = PollingConfig(polling_interval=0.5, timeout=20),
+        file_name: str = "/var/log/syslog",
+    ) -> None:
+        """Wait until `pattern` appears at least `expected_cnt` times in
+        `file_name` after `marker` (obtained from add_log_marker).
+
+        `pattern` is a grep basic regular expression.
+        """
+        def log_seen():
+            # POSIX awk (no gawk ENDFILE): print lines after the one containing
+            # the marker (literal match), then count pattern occurrences.
+            # marker/pattern/file are passed as positional parameters instead of
+            # being interpolated into the script, so shell/awk/grep
+            # metacharacters in them can't break the command.
+            _, output = self.runcmd([
+                "sh", "-c",
+                'awk -v m="$1" \'found; index($0, m) {found=1}\' "$3"'
+                ' | grep -c -e "$2"',
+                "sh", marker, pattern, file_name])
+            # runcmd merges stderr into output; a warning from awk/grep (e.g.
+            # syslog not created yet) must count as "not seen yet", not escape
+            # the polling loop as a ValueError
+            try:
+                cnt = int(output.strip())
+            except ValueError:
+                return (False, output.strip())
+            return (cnt >= expected_cnt, output.strip())
+
+        wait_for_result(
+            log_seen,
+            polling_config,
+            f"Pattern '{pattern}' did not appear {expected_cnt} time(s)"
+            f" in {file_name} after marker")
+
     # start processes in SWSS
     # deps: acl, fdb, port_an, port_config, warm_reboot
     def start_swss(self):

@@ -19,6 +19,7 @@ extern "C" {
 #include "table.h"
 #include "consumertable.h"
 #include "consumerstatetable.h"
+#include "subscriberstatetable.h"
 #include "zmqconsumerstatetable.h"
 #include "zmqserver.h"
 #include "notificationconsumer.h"
@@ -160,10 +161,21 @@ typedef std::map<std::string, std::shared_ptr<Executor>> ConsumerMap;
 
 class ConsumerBase : public Executor {
 public:
+<<<<<<< HEAD
     ConsumerBase(swss::Selectable *selectable, Orch *orch, const std::string &name)
         : Executor(selectable, orch, name)
+=======
+    ConsumerBaseCommon(swss::Selectable *selectable, Orch *orch, const std::string &name)
+        : Executor(selectable, orch, name),
+          m_fullSnapshotSource(dynamic_cast<swss::SubscriberStateTable *>(selectable) != nullptr)
+>>>>>>> 86f0ea91 (NOS-7538: [orchagent] Replace pending SET instead of merging for full-snapshot consumers (#1108))
     {
     }
+
+    /* True when the source emits the complete entry per event. This is true for
+     * SubscriberStateTable, which re-reads the whole hash on every keyspace
+     * notification. */
+    const bool m_fullSnapshotSource;
 
     virtual swss::TableBase *getConsumerTable() const = 0;
 
@@ -218,8 +230,96 @@ public:
      */
     bool addToRetry(const Task &task, const Constraint &cst);
 
+<<<<<<< HEAD
     size_t refillToSync();
     size_t refillToSync(swss::Table* table);
+=======
+    virtual size_t refillToSync() = 0;
+    virtual size_t refillToSync(swss::Table* table) = 0;
+
+private:
+    bool m_recordable = true;
+};
+
+/* Map-merge policies for ConsumerBaseTemplate. apply() folds one incoming
+ * tuple into the pending-task map; everything else around it (recording,
+ * retry-cache interaction) is shared and lives in addToSyncInternal. */
+struct MultimapMerge
+{
+    /* Historical ConsumerBase semantics, extracted verbatim: at most two
+     * entries per key (DEL then SET), field-level merge of consecutive
+     * SETs. When fullSnapshotSource is set (SubscriberStateTable-backed
+     * consumers, whose events carry the complete entry) a consecutive SET
+     * replaces the pending SET instead of field-merging into it, so a field
+     * deleted upstream cannot survive in a parked entry; DEL-then-SET
+     * ordering is preserved either way. */
+    static void apply(SyncMap &toSync, const std::string &key, const std::string &op,
+                      const swss::KeyOpFieldsValuesTuple &entry, bool fullSnapshotSource);
+};
+
+struct OverwriteMerge
+{
+    /* Last-writer-wins, wholesale: any op replaces any pending entry for the
+     * key. Correct only for full-replace producers; see the RouteSyncMap
+     * comment. fullSnapshotSource is ignored -- every entry already replaces
+     * wholesale. */
+    static void apply(RouteSyncMap &toSync, const std::string &key, const std::string &op,
+                      const swss::KeyOpFieldsValuesTuple &entry, bool fullSnapshotSource);
+};
+
+/*
+ * The map-typed consumer core. Method bodies live in orch.cpp and are
+ * explicitly instantiated there for exactly:
+ *
+ *   ConsumerBaseTemplate<SyncMap, MultimapMerge>        (ConsumerBase)
+ *   ConsumerBaseTemplate<RouteSyncMap, OverwriteMerge>  (ZmqRouteConsumer)
+ *
+ * A new instantiation fails to link until deliberately added to orch.cpp.
+ * That is a speed bump, not a review gate: the linker error forces the new
+ * map/merge combination (and any test fakes that stub these types, e.g.
+ * p4orch's fake_routeorch) to be added explicitly instead of appearing
+ * silently via implicit instantiation.
+ */
+template <typename MapT, typename MergePolicy>
+class ConsumerBaseTemplate : public ConsumerBaseCommon {
+public:
+    ConsumerBaseTemplate(swss::Selectable *selectable, Orch *orch, const std::string &name)
+        : ConsumerBaseCommon(selectable, orch, name)
+    {
+    }
+
+    /* The concrete pending-task map type; lets code templated over the
+     * consumer type name the matching iterator (e.g. RouteOrch's task
+     * helpers). */
+    using SyncMapT = MapT;
+
+    /* Store the latest 'golden' status */
+    // TODO: hide?
+    MapT m_toSync;
+
+    bool hasPendingTasks() const override
+    {
+        return !m_toSync.empty() || !m_toSyncQueue.empty();
+    }
+
+    using ConsumerBaseCommon::addToSync;    /* keep the shared_ptr overload visible */
+    void addToSync(const swss::KeyOpFieldsValuesTuple &entry, bool onRetry=false) override;
+    size_t addToSync(const std::deque<swss::KeyOpFieldsValuesTuple> &entries, bool onRetry=false) override;
+
+    /* Re-insertion merge for entries the drain took out of m_toSync and is
+     * giving back (retained retries, parked resync DELs, deferred not-ready
+     * entries): identical merge and retry-cache supersession semantics to
+     * addToSync(onRetry=false), but nothing is written to swss.rec -- the
+     * recorder sees each producer operation exactly once, at first arrival,
+     * and these tuples either were recorded then or are synthesized
+     * bookkeeping that was never recorded at all. */
+    size_t addToSyncNoRecord(const std::deque<swss::KeyOpFieldsValuesTuple> &entries);
+
+    size_t refillToSync() override;
+    size_t refillToSync(swss::Table* table) override;
+
+    void dumpPendingTasks(std::vector<std::string> &ts) override;
+>>>>>>> 86f0ea91 (NOS-7538: [orchagent] Replace pending SET instead of merging for full-snapshot consumers (#1108))
 
     // Set the m_orderedQueue flag.
     // This will change the ConsumerBase to use m_toSync or m_toSyncQueue.

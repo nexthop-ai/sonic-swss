@@ -335,6 +335,15 @@ void ConsumerBase::addToSyncInternal(const KeyOpFieldsValuesTuple &entry, bool o
         return;
     }
 
+<<<<<<< HEAD
+=======
+    MergePolicy::apply(m_toSync, key, op, entry, m_fullSnapshotSource);
+}
+
+void MultimapMerge::apply(SyncMap &toSync, const string &key, const string &op,
+                          const KeyOpFieldsValuesTuple &entry, bool fullSnapshotSource)
+{
+>>>>>>> 86f0ea91 (NOS-7538: [orchagent] Replace pending SET instead of merging for full-snapshot consumers (#1108))
     /*
     * m_toSync is a multimap which will allow one key with multiple values,
     * Also, the order of the key-value pairs whose keys compare equivalent
@@ -378,6 +387,10 @@ void ConsumerBase::addToSyncInternal(const KeyOpFieldsValuesTuple &entry, bool o
         {
             m_toSync.emplace(key, entry);
         }
+        else if (fullSnapshotSource)
+        {
+            iter->second = entry;
+        }
         else
         {
             KeyOpFieldsValuesTuple existing_data = iter->second;
@@ -408,7 +421,31 @@ void ConsumerBase::addToSyncInternal(const KeyOpFieldsValuesTuple &entry, bool o
 
 }
 
+<<<<<<< HEAD
 size_t ConsumerBase::addToSync(const std::deque<KeyOpFieldsValuesTuple> &entries, bool onRetry)
+=======
+void OverwriteMerge::apply(RouteSyncMap &toSync, const string &key, const string &op,
+                           const KeyOpFieldsValuesTuple &entry, bool /* fullSnapshotSource */)
+{
+    /* Full-replace producer: the newest tuple wins wholesale. A SET
+     * overwriting a pending DEL is the collapse this policy is only valid
+     * for when the drain updates existing keys in place (see the
+     * RouteSyncMap comment); it is expected during route flaps for the
+     * qualified producers, so log it at INFO -- visible when chasing a
+     * merge-semantics suspicion, not alarm spam per flap. */
+    auto existing = toSync.find(key);
+    if (existing != toSync.end() && op == SET_COMMAND &&
+        kfvOp(existing->second) == DEL_COMMAND)
+    {
+        SWSS_LOG_INFO("Overwrite merge: SET supersedes pending DEL for %s", key.c_str());
+    }
+    toSync[key] = entry;
+}
+
+
+template <typename MapT, typename MergePolicy>
+size_t ConsumerBaseTemplate<MapT, MergePolicy>::addToSync(const std::deque<KeyOpFieldsValuesTuple> &entries, bool onRetry)
+>>>>>>> 86f0ea91 (NOS-7538: [orchagent] Replace pending SET instead of merging for full-snapshot consumers (#1108))
 {
     SWSS_LOG_ENTER();
 

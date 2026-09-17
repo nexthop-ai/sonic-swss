@@ -1,6 +1,7 @@
 from swsscommon import swsscommon
 from swsscommon.swsscommon import CounterTable, MacsecCounter
 import conftest
+import pytest
 
 import time
 import functools
@@ -896,6 +897,89 @@ class TestMACsec(object):
 
         # Clear MACsec enabled on Ethernet0
         ConfigTable(dvs, "PORT")["Ethernet0"] = {"macsec" : ""}
+
+    def test_macsec_delete_on_down_port(self, dvs: conftest.DockerVirtualSwitch, testlog):
+        # Delete the macsec field from a PORT entry while the port is down and
+        # a macsec-bearing snapshot is parked in macsecmgrd on task_need_retry.
+        # macsecmgrd must tear the MACsec session down instead of acting on the
+        # stale parked snapshot.
+        port_name = "Ethernet0"
+        profile_name = "test_snapshot_profile"
+
+        exitcode, _ = dvs.runcmd("supervisorctl status macsecmgrd")
+        if exitcode != 0:
+            pytest.skip("macsecmgrd is not in the stock docker-sonic-vs image; "
+                        "runs once NOS-15228 adds it")
+        exitcode, _ = dvs.runcmd("which wpa_supplicant")
+        if exitcode != 0:
+            pytest.skip("wpa_supplicant is not in the stock docker-sonic-vs image; "
+                        "runs once NOS-15228 adds it")
+
+        config_db = dvs.get_config_db()
+        state_db = dvs.get_state_db()
+        app_db = dvs.get_app_db()
+
+        # The parked-entry retry path only logs at DEBUG level
+        dvs.runcmd("swssloglevel -l DEBUG -c macsecmgrd")
+        try:
+            dvs.port_admin_set(port_name, "up")
+            state_db.wait_for_field_match(
+                "PORT_TABLE", port_name,
+                {"state": "ok", "netdev_oper_status": "up"})
+
+            # primary_cak is Type-7 encoded (2-digit salt index + XOR-encoded
+            # hex, see decodeKey in macsecmgr.cpp); this decodes to "0" * 32
+            ConfigTable(dvs, "MACSEC_PROFILE")[profile_name] = {
+                "cipher_suite": "GCM-AES-128",
+                "primary_cak": "00544356540B5B565F711C1E59495547"
+                               "425B5C547A7B7478636572435746535106",
+                "primary_ckn": "6162636465666768696A6B6C6D6E6F70",
+            }
+            config_db.update_entry("PORT", port_name, {"macsec": profile_name})
+            app_db.wait_for_entry("MACSEC_PORT_TABLE", port_name)
+
+            dvs.port_admin_set(port_name, "down")
+            state_db.wait_for_field_match(
+                "PORT_TABLE", port_name, {"netdev_oper_status": "down"})
+
+            # Any PORT update processed now carries the macsec field while
+            # isPortStateOk is false, so macsecmgrd parks it with
+            # task_need_retry. macsecmgrd re-runs doTask (and re-logs the
+            # retry-path message) every SELECT_TIMEOUT (1s) while an entry is
+            # parked in m_toSync, so seeing it after the marker proves a
+            # macsec-bearing snapshot is parked before we delete the macsec
+            # field.
+            marker = dvs.add_log_marker()
+            config_db.update_entry("PORT", port_name, {"description": "park"})
+            dvs.wait_for_log(
+                marker, "The port .{}. isn.t ready".format(port_name))
+
+            # Emulate "config macsec port del": write the remaining fields and
+            # HDEL the macsec field, same as ConfigDBConnector.set_entry
+            port_entry = config_db.get_entry("PORT", port_name)
+            del port_entry["macsec"]
+            config_db.set_entry("PORT", port_name, port_entry)
+
+            # The new snapshot must replace the parked one, and the next retry
+            # pass must take the disable path while the port is still down. If
+            # the stale merge keeps the macsec field, the entry stays parked
+            # and this wait times out.
+            app_db.wait_for_deleted_entry("MACSEC_PORT_TABLE", port_name)
+            exitcode, output = dvs.runcmd(
+                "pgrep -f 'wpa_supplicant.*-g /var/run/{}'".format(port_name))
+            assert exitcode != 0, \
+                "wpa_supplicant is still running for {}: {}".format(
+                    port_name, output)
+        finally:
+            dvs.runcmd("swssloglevel -l NOTICE -c macsecmgrd")
+            # A mid-test failure leaves the macsec field set; drop it before
+            # deleting the profile it references (no-op on the success path)
+            config_db.delete_field("PORT", port_name, "macsec")
+            config_db.delete_field("PORT", port_name, "description")
+            del ConfigTable(dvs, "MACSEC_PROFILE")[profile_name]
+            dvs.port_admin_set(port_name, "up")
+            state_db.wait_for_field_match(
+                "PORT_TABLE", port_name, {"netdev_oper_status": "up"})
 
 
 # Add Dummy always-pass test at end as workaroud

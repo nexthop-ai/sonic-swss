@@ -1,0 +1,219 @@
+# Development Workflow Configuration
+# Defines repositories, dependencies, and build components for rapid development
+
+repositories:
+  # Primary repository - always included
+  sonic-swss:
+    path: ..                          # Relative to this config file (dev/)
+    type: autotools                    # Build system: autotools, cargo, cmake
+
+    # Build configuration commands (run in container at /build/{repo_name})
+    configure_commands:
+      - ./autogen.sh
+      - ./configure
+
+    # Build commands (run after configure)
+    build_commands:
+      - make -j$(( $(nproc) * 4 / 5 )) all
+
+    # Unit test commands (optional, for future use)
+    ut_commands:
+      - make check
+
+    # System dependencies (apt packages)
+    # These will be installed in the test-runner container
+    system_deps:
+      - build-essential
+      - autoconf
+      - automake
+      - libtool
+      - pkg-config
+      - libhiredis-dev
+      - libjansson-dev
+      - libzmq3-dev
+      - libprotobuf-dev
+      - protobuf-compiler
+      - libyaml-cpp-dev
+      - libjemalloc-dev
+      - nlohmann-json3-dev
+      - libgtest-dev
+      - libgmock-dev
+      - libboost-program-options-dev
+      # Rust build dependencies (for countersyncd)
+      - cargo
+      - rustc
+
+    # SONiC package dependencies
+    # These are installed from the local apt repository (target/debs/<bldenv>, e.g. trixie)
+    sonic_deps:
+      - libnl-3-dev
+      - libnl-route-3-dev
+      - libnl-genl-3-dev
+      - libnl-nf-3-dev
+      - libteam-dev
+      - libswsscommon-dev
+      - libsairedis-dev
+      - libsaimetadata-dev
+      - libsaivs-dev
+      - libsaivs
+      - libdashapi
+      - libnexthopgroup-dev
+
+    # Components to deploy (after build)
+    # Build runs 'make all', then we find and deploy these targets
+    components:
+      # C++ binaries - all executables deployed to /usr/bin
+      - name: cpp-bins
+        type: binary
+        targets:
+          - orchagent
+          - portsyncd
+          - neighsyncd
+          - fdbsyncd
+          - teamsyncd
+          - fpmsyncd
+          - natsyncd
+          - portmgrd
+          - intfmgrd
+          - vlanmgrd
+          - teammgrd
+          - vrfmgrd
+          - buffermgrd
+          - nbrmgrd
+          - vxlanmgrd
+          - sflowmgrd
+          - natmgrd
+          - tunnelmgrd
+          - fabricmgrd
+          - coppmgrd
+          - macsecmgrd
+        deploy_to: /usr/bin
+
+    # Other repositories this depends on (optional, user must specify to include)
+    repo_deps:
+      - sonic-swss-common
+
+  # Optional repository - included only if user specifies --repo sonic-swss-common
+  sonic-swss-common:
+    path: ../../sonic-swss-common     # Default path (can be overridden with --repo sonic-swss-common=/custom/path)
+    type: autotools
+
+    # Build configuration commands
+    configure_commands:
+      - ./autogen.sh
+      - ./configure
+
+    # Build commands
+    build_commands:
+      - make -j$(( $(nproc) * 4 / 5 )) all
+
+    # Unit test commands
+    ut_commands:
+      - make check
+
+    system_deps:
+      - build-essential
+      - autoconf
+      - automake
+      - libtool
+      - pkg-config
+      - libhiredis-dev
+      - libnl-3-dev
+      - libnl-route-3-dev
+      - libnl-genl-3-dev
+      - libnl-nf-3-dev
+      - libboost-dev
+      - libboost-serialization-dev
+      - libzmq3-dev
+      - libyaml-cpp-dev
+      - nlohmann-json3-dev
+      # Rust support (swss-common has Rust bindings)
+      - cargo
+      - rustc
+      # Python dependencies for gen_cfg_schema.py build script
+      - python3
+      - python3-pip
+      - python3-setuptools
+      - python3-wheel
+      # YANG dependencies for gen_cfg_schema.py
+      - uuid-dev
+      - swig
+
+    # Python packages to install via pip (needed for gen_cfg_schema.py)
+    pip_deps:
+      - pyang
+
+    # SONiC packages needed for YANG support in gen_cfg_schema.py
+    sonic_deps:
+      - libyang-cpp_1.0.73_amd64.deb
+      - libyang3_3.12.2-1_amd64.deb
+      - python3-libyang_3.1.0-1_amd64.deb
+      - python3-yang_1.0.73_amd64.deb
+      - libyang-dev_1.0.73_amd64.deb
+
+    # SONiC Python wheels (from target/python-wheels/<bldenv>/, e.g. trixie)
+    sonic_whl_deps:
+      - sonic_yang_mgmt-1.0-py3-none-any.whl
+      - sonic_yang_models-1.0-py3-none-any.whl
+
+    components:
+      - name: libswsscommon
+        type: shared-library
+        build_dir: common/.libs
+        deploy_to: /usr/lib/x86_64-linux-gnu/libswsscommon.so.1
+        # Post-build: install headers and library so swss can use them
+        post_build:
+          - mkdir -p /usr/include/swss
+          - rsync -a --checksum common/*.h /usr/include/swss/
+          - mkdir -p /usr/include/swss/c-api
+          - rsync -a --checksum common/c-api/*.h /usr/include/swss/c-api/
+          - mkdir -p /usr/lib/x86_64-linux-gnu
+          - rsync -a --checksum common/.libs/libswsscommon.so* /usr/lib/x86_64-linux-gnu/
+          - ldconfig
+
+    repo_deps: []
+
+  # Future: Add more repositories as needed
+  # Uncomment and configure when you want to develop on these repos
+
+  # sonic-sairedis:
+  #   path: ../sonic-sairedis
+  #   type: autotools
+  #
+  #   system_deps:
+  #     - build-essential
+  #     - autoconf
+  #     - automake
+  #     - libtool
+  #     - libhiredis-dev
+  #     - libnl-3-dev
+  #
+  #   sonic_deps:
+  #     - libswsscommon-dev
+  #
+  #   components:
+  #     - name: libsairedis
+  #       type: shared-library
+  #       deploy_to: /usr/lib/x86_64-linux-gnu/libsairedis.so.1
+  #       post_build:
+  #         - make install DESTDIR=/build/install-root
+  #
+  #   repo_deps:
+  #     - sonic-swss-common
+
+# Usage examples:
+#
+# 1. Default (only sonic-swss):
+#    ./dvs-test.py prepare --dev
+#
+# 2. Include swss-common:
+#    ./dvs-test.py prepare --dev --repo swss-common
+#
+# 3. Override swss-common path:
+#    ./dvs-test.py prepare --dev --repo swss-common=/custom/path/sonic-swss-common
+#
+# 4. Multiple repos:
+#    ./dvs-test.py prepare --dev --repo swss-common --repo sairedis
+#
+# 5. List available repos:
+#    ./dvs-test.py --list-repos
