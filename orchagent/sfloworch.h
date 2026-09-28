@@ -109,12 +109,19 @@ class SflowOrch : public Orch
 public:
     SflowOrch(DBConnector* db, std::vector<std::string> &tableNames);
 
+    bool bake() override;
+    void onWarmBootEnd() override;
+
 private:
     SflowPortInfoMap    m_sflowPortInfoMap;
     SflowRateSampleMap  m_sflowRateSampleMap;
     bool                m_sflowStatus;
+<<<<<<< HEAD
     SflowDropMonitor    m_sflowDropMonitor;
 
+=======
+    bool                m_warmRestoreInProgress = false;
+>>>>>>> 05eded02 (NOS-16297: sfloworch: skip samplepacket ownership check during warm restore (#1179))
 
     virtual void doTask(Consumer& consumer);
     bool sflowCreateSession(uint32_t rate, SflowSession &session);

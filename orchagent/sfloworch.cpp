@@ -805,11 +805,32 @@ bool SflowOrch::isSflowSamplePacket(sai_object_id_t oid)
     return false;
 }
 
+bool SflowOrch::bake()
+{
+    bool ok = Orch::bake();
+    if (ok)
+    {
+        m_warmRestoreInProgress = true;
+    }
+    return ok;
+}
+
+void SflowOrch::onWarmBootEnd()
+{
+    Orch::onWarmBootEnd();
+    m_warmRestoreInProgress = false;
+}
+
 // Check-before-set: refuse to bind sFlow if this port's samplepacket attr is
 // already owned by another (non-sFlow) feature
 bool SflowOrch::isSamplepacketFreeForSflow(sai_object_id_t port_id, sai_port_attr_t attr_id,
                                            sai_object_id_t sample_id, const char* dir_name)
 {
+    if (m_warmRestoreInProgress)
+    {
+        return true;
+    }
+
     sai_attribute_t check_attr;
     check_attr.id = attr_id;
     if (sai_port_api->get_port_attribute(port_id, 1, &check_attr) == SAI_STATUS_SUCCESS

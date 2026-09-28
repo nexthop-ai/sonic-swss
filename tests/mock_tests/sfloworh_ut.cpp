@@ -1256,6 +1256,40 @@ namespace sflow_test
         sai_samplepacket_api->remove_samplepacket(new_sflow_oid);
     }
 
+    TEST_F(SflowOrchTest, SflowAddPortSkipsOwnershipCheckDuringWarmRestore)
+    {
+        mirror_sample_port_wrap_ut::PortSampleSaiGuard saiPortSampleGuard;
+
+        MockSflowOrch mock_orch;
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", port));
+
+        sai_attribute_t sp_attr;
+        sp_attr.id = SAI_SAMPLEPACKET_ATTR_SAMPLE_RATE;
+        sp_attr.value.u32 = 4000;
+        sai_object_id_t prior_oid, replayed_oid;
+        ASSERT_EQ(sai_samplepacket_api->create_samplepacket(&prior_oid, gSwitchId, 1, &sp_attr), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(sai_samplepacket_api->create_samplepacket(&replayed_oid, gSwitchId, 1, &sp_attr), SAI_STATUS_SUCCESS);
+
+        // Port still holds the pre-reboot samplepacket, unknown to the rebuilt sFlow map.
+        sai_attribute_t attr;
+        attr.id = SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE;
+        attr.value.oid = prior_oid;
+        ASSERT_EQ(sai_port_api->set_port_attribute(port.m_port_id, &attr), SAI_STATUS_SUCCESS);
+
+        ASSERT_TRUE(mock_orch.get().bake());
+        ASSERT_TRUE(Portal::SflowOrchInternal::sflowAddPort(mock_orch.get(), replayed_oid, port.m_port_id, "rx"));
+
+        mock_orch.get().onWarmBootEnd();
+        ASSERT_EQ(sai_port_api->set_port_attribute(port.m_port_id, &attr), SAI_STATUS_SUCCESS);
+        ASSERT_FALSE(Portal::SflowOrchInternal::sflowAddPort(mock_orch.get(), replayed_oid, port.m_port_id, "rx"));
+
+        attr.value.oid = SAI_NULL_OBJECT_ID;
+        sai_port_api->set_port_attribute(port.m_port_id, &attr);
+        sai_samplepacket_api->remove_samplepacket(prior_oid);
+        sai_samplepacket_api->remove_samplepacket(replayed_oid);
+    }
+
     TEST_F(SflowOrchTest, SflowUpdateDirectionRejectsConflictingBinding)
     {
         MockSflowOrch mock_orch;
