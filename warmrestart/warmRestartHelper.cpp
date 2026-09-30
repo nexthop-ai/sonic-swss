@@ -187,10 +187,30 @@ void WarmStartHelper::reconcile(void)
 {
     SWSS_LOG_NOTICE("Warm-Restart: Initiating reconciliation process for %s "
                     "application.", m_appName.c_str());
+    SWSS_LOG_NOTICE("Warm-Restart reconciliation: %zu restored entries, "
+                    "%zu refreshed entries",
+                    m_restorationVector.size(),
+                    m_refreshMap.size());
 
     assert(getState() == WarmStart::RESTORED);
 
+<<<<<<< HEAD
     for (auto &table : m_tableContexts)
+=======
+    /*
+     * Tally of what reconciliation did, logged as a summary at the end.
+     *   (staleDeleted + deleted + updated + unchanged) == (restored_entries)
+     *   (created + discarded) == (refreshed_entries - (deleted + updated + unchanged))
+     */
+    size_t staleDeletedCount = 0;
+    size_t deletedCount      = 0;
+    size_t updatedCount      = 0;
+    size_t unchangedCount    = 0;
+    size_t discardedCount    = 0;
+    size_t createdCount      = 0;
+
+    for (auto &restoredElem : m_restorationVector)
+>>>>>>> 37028ada (NOS-17515: Route deletion happens before EOR timer expiry in BGP warm restart scenario (#1365))
     {
         auto &context = *table.second;
 
@@ -199,13 +219,45 @@ void WarmStartHelper::reconcile(void)
             std::string restoredKey  = kfvKey(restoredElem);
             auto restoredFV          = kfvFieldsValues(restoredElem);
 
+<<<<<<< HEAD
             auto iter = context.refreshMap.find(restoredKey);
 
             if (iter == context.refreshMap.end())
+=======
+            staleDeletedCount++;
+            m_syncTable->del(restoredKey);
+            continue;
+        }
+
+        /*
+         * If an explicit delete request is sent by the application, process it
+         * right away.
+         */
+        else if (kfvOp(iter->second) == DEL_COMMAND)
+        {
+            SWSS_LOG_NOTICE("Warm-Restart reconciliation: deleting entry %s",
+                            printKFV(restoredKey, restoredFV).c_str());
+
+            deletedCount++;
+            m_syncTable->del(restoredKey);
+        }
+
+        /*
+         * If a matching entry is found in refreshMap, proceed to compare it
+         * with its restored counterpart.
+         */
+        else
+        {
+            auto refreshedKey = kfvKey(iter->second);
+            auto refreshedFV  = kfvFieldsValues(iter->second);
+
+            if (compareAllFV(restoredFV, refreshedFV))
+>>>>>>> 37028ada (NOS-17515: Route deletion happens before EOR timer expiry in BGP warm restart scenario (#1365))
             {
                 SWSS_LOG_NOTICE("Warm-Restart reconciliation: deleting stale entry %s from %s",
                                 printKFV(restoredKey, restoredFV).c_str(), table.first.c_str());
 
+<<<<<<< HEAD
                 context.syncTable->del(restoredKey);
                 continue;
             }
@@ -259,6 +311,18 @@ void WarmStartHelper::reconcile(void)
                                 printKFV(refreshedKey, refreshedFV).c_str(), table.first.c_str());
 
                 context.syncTable->set(refreshedKey, refreshedFV);
+=======
+                updatedCount++;
+                m_syncTable->set(refreshedKey, refreshedFV);
+            }
+            else
+            {
+                SWSS_LOG_INFO("Warm-Restart reconciliation: no changes needed for "
+                              "existing entry %s",
+                              printKFV(refreshedKey, refreshedFV).c_str());
+
+                unchangedCount++;
+>>>>>>> 37028ada (NOS-17515: Route deletion happens before EOR timer expiry in BGP warm restart scenario (#1365))
             }
         }
 
@@ -266,7 +330,55 @@ void WarmStartHelper::reconcile(void)
         context.restorationVector.clear();
     }
 
+<<<<<<< HEAD
+=======
+    /*
+     * Iterate through all the entries left in the refreshMap, which correspond
+     * to brand-new entries to be pushed down to AppDB.
+     */
+    for (auto &kfv : m_refreshMap)
+    {
+        auto refreshedKey = kfvKey(kfv.second);
+        auto refreshedOp  = kfvOp(kfv.second);
+        auto refreshedFV  = kfvFieldsValues(kfv.second);
+
+        /*
+         * During warm-reboot, apps could receive an 'add' and a 'delete' for an
+         * entry that does not exist in AppDB. In these cases we must prevent the
+         * 'delete' from being pushed down to AppDB, so we are handling this case
+         * differently than the 'add' one.
+         */
+        if(refreshedOp == DEL_COMMAND)
+        {
+            SWSS_LOG_NOTICE("Warm-Restart reconciliation: discarding non-existing"
+                            " entry %s\n",
+                            refreshedKey.c_str());
+
+            discardedCount++;
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("Warm-Restart reconciliation: introducing new entry %s",
+                            printKFV(refreshedKey, refreshedFV).c_str());
+
+            createdCount++;
+            m_syncTable->set(refreshedKey, refreshedFV);
+        }
+    }
+
+    /* Clearing pending kfv's from refreshMap */
+    m_refreshMap.clear();
+
+    /* Clearing restoration vector */
+    m_restorationVector.clear();
+
+>>>>>>> 37028ada (NOS-17515: Route deletion happens before EOR timer expiry in BGP warm restart scenario (#1365))
     setState(WarmStart::RECONCILED);
+
+    SWSS_LOG_NOTICE("Warm-Restart reconciliation: %zu stale_deleted, %zu deleted, "
+                    "%zu updated, %zu unchanged, %zu created, %zu discarded",
+                    staleDeletedCount, deletedCount, updatedCount,
+                    unchangedCount, createdCount, discardedCount);
 
     SWSS_LOG_NOTICE("Warm-Restart: Concluded reconciliation process for %s "
                     "application.", m_appName.c_str());
