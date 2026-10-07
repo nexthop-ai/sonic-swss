@@ -630,6 +630,9 @@ bool MuxCable::nbrHandler(bool enable, bool update_rt)
         }
         // Loop through all routes with nexthops through this mux cable when changing state
         updateRoutes();
+        // The slice route still references the anchor's local nexthop, and
+        // disable() removes that nexthop, so move the route to the tunnel first.
+        refreshSliceRoute(tnh);
         ret = nbr_handler_->disable(tnh);
     }
     return ret;
@@ -700,7 +703,7 @@ void MuxCable::updateRoutesForNextHop(NextHopKey nh)
     }
 }
 
-void MuxCable::refreshSliceRoute()
+void MuxCable::refreshSliceRoute(sai_object_id_t nh_override)
 {
     if (!hasSlicePrefix())
     {
@@ -716,6 +719,11 @@ void MuxCable::refreshSliceRoute()
     if (desired == SAI_NULL_OBJECT_ID)
     {
         return;
+    }
+
+    if (nh_override != SAI_NULL_OBJECT_ID)
+    {
+        desired = nh_override;
     }
 
     if (slice_route_nh_oid_ == SAI_NULL_OBJECT_ID)

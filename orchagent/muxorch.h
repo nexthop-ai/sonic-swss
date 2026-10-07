@@ -164,7 +164,7 @@ public:
     void updateRoutesForNextHop(NextHopKey nh);
 
     // Slice supernet route tracking (see refreshSliceRoute in muxorch.cpp).
-    void refreshSliceRoute();
+    void refreshSliceRoute(sai_object_id_t nh_override = SAI_NULL_OBJECT_ID);
     sai_object_id_t getNextHopId(const NextHopKey nh)
     {
         return nbr_handler_->getNextHopId(nh);
