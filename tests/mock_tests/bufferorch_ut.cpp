@@ -23,6 +23,28 @@ namespace bufferorch_test
     sai_buffer_api_t *pold_sai_buffer_api;
     sai_queue_api_t ut_sai_queue_api;
     sai_queue_api_t *pold_sai_queue_api;
+    sai_switch_api_t ut_sai_switch_api;
+    sai_switch_api_t *pold_sai_switch_api;
+
+    // Total buffer size, in kB, reported for SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE. The VS switch does
+    // not implement the attribute, so BufferOrch cannot check buffer pool sizes without this stub.
+    // The value is what an NH-4010 actually reports - mmu_size 173267968 bytes, measured on a real
+    // device - so the platform defaults asserted below are checked against a realistic budget.
+    const sai_uint64_t _ut_stub_total_buffer_size_kb = 169207;
+    const sai_uint64_t _ut_stub_total_buffer_size_bytes = _ut_stub_total_buffer_size_kb * 1024;
+
+    sai_status_t _ut_stub_sai_get_switch_attribute(
+        _In_ sai_object_id_t switch_id,
+        _In_ sai_uint32_t attr_count,
+        _Inout_ sai_attribute_t *attr_list)
+    {
+        if (attr_count == 1 && attr_list[0].id == SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE)
+        {
+            attr_list[0].value.u64 = _ut_stub_total_buffer_size_kb;
+            return SAI_STATUS_SUCCESS;
+        }
+        return pold_sai_switch_api->get_switch_attribute(switch_id, attr_count, attr_list);
+    }
 
     shared_ptr<swss::DBConnector> m_app_db;
     shared_ptr<swss::DBConnector> m_app_state_db;
@@ -239,6 +261,11 @@ namespace bufferorch_test
             };
 
             ut_helper::initSaiApi(profile);
+
+            pold_sai_switch_api = sai_switch_api;
+            ut_sai_switch_api = *pold_sai_switch_api;
+            ut_sai_switch_api.get_switch_attribute = _ut_stub_sai_get_switch_attribute;
+            sai_switch_api = &ut_sai_switch_api;
 
             // Init switch and create dependencies
             m_app_db = make_shared<swss::DBConnector>("APPL_DB", 0);
@@ -468,9 +495,88 @@ namespace bufferorch_test
             delete gQosOrch;
             gQosOrch = nullptr;
 
+            sai_switch_api = pold_sai_switch_api;
+
             ut_helper::uninitSaiApi();
         }
     };
+
+    // Runs doTask with the swss logger redirected to stderr so that the emitted log can be asserted
+    // on, and restores syslog output afterwards.
+    static std::string drainBufferOrchCapturingLog()
+    {
+        swss::Logger::swssOutputNotify("", "STDERR");
+        testing::internal::CaptureStderr();
+        static_cast<Orch *>(gBufferOrch)->doTask();
+        std::string logs = testing::internal::GetCapturedStderr();
+        swss::Logger::swssOutputNotify("", "SYSLOG");
+        return logs;
+    }
+
+    // NOS-5671: a buffer pool larger than the device's buffer is accepted by SAI and only shows up
+    // later as ports that never come up. BufferOrch must say so in the log.
+    TEST_F(BufferOrchTest, BufferOrchTestPoolLargerThanMmuIsLogged)
+    {
+        Table bufferPoolTable = Table(m_app_db.get(), APP_BUFFER_POOL_TABLE_NAME);
+
+        // The size from the ticket: the NH-4010 default with one digit too many.
+        bufferPoolTable.set("egress_lossless_pool",
+                            {
+                                {"size", "12196419600"},
+                                {"mode", "static"},
+                                {"type", "egress"}
+                            });
+        gBufferOrch->addExistingData(&bufferPoolTable);
+
+        auto logs = drainBufferOrchCapturingLog();
+
+        EXPECT_NE(logs.find("Buffer pool egress_lossless_pool is configured with size 12196419600 bytes, "
+                            "which exceeds the " + std::to_string(_ut_stub_total_buffer_size_bytes) + " bytes"),
+                  std::string::npos);
+    }
+
+    // The shared headroom pool is sized independently of the pool, so it needs its own check.
+    TEST_F(BufferOrchTest, BufferOrchTestSharedHeadroomLargerThanMmuIsLogged)
+    {
+        Table bufferPoolTable = Table(m_app_db.get(), APP_BUFFER_POOL_TABLE_NAME);
+
+        bufferPoolTable.set("ingress_lossless_pool",
+                            {
+                                {"xoff", "2952089600"}
+                            });
+        gBufferOrch->addExistingData(&bufferPoolTable);
+
+        auto logs = drainBufferOrchCapturingLog();
+
+        EXPECT_NE(logs.find("shared headroom pool (xoff) of 2952089600 bytes"), std::string::npos);
+    }
+
+    // Regression guard: on Broadcom the ingress and egress pools describe the same physical memory
+    // and xoff is accounted separately, so a platform's own defaults must not be reported. These are
+    // the NH-4010 BALANCED t0 values, which together come to well over the device's buffer.
+    TEST_F(BufferOrchTest, BufferOrchTestPlatformDefaultsAreNotLogged)
+    {
+        Table bufferPoolTable = Table(m_app_db.get(), APP_BUFFER_POOL_TABLE_NAME);
+
+        bufferPoolTable.set("ingress_lossless_pool",
+                            {
+                                {"size", "121964196"},
+                                {"mode", "dynamic"},
+                                {"type", "ingress"},
+                                {"xoff", "29520896"}
+                            });
+        bufferPoolTable.set("egress_lossless_pool",
+                            {
+                                {"size", "121964196"},
+                                {"mode", "static"},
+                                {"type", "egress"}
+                            });
+        gBufferOrch->addExistingData(&bufferPoolTable);
+
+        auto logs = drainBufferOrchCapturingLog();
+
+        EXPECT_EQ(logs.find("which exceeds the"), std::string::npos);
+    }
 
     TEST_F(BufferOrchTest, BufferOrchTestSharedHeadroomPool)
     {

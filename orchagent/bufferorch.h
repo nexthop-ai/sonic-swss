@@ -124,6 +124,8 @@ private:
     void initVoqBufferReadyList(Table& table, bool isConfigDb);
     void initFlexCounterGroupTable(void);
     void initBufferConstants();
+    void checkBufferPoolSizeAgainstMmu(const std::string &pool_name, bool has_size, sai_uint64_t size,
+                                       bool has_xoff, sai_uint64_t xoff);
     task_process_status processBufferPool(KeyOpFieldsValuesTuple &tuple);
     task_process_status processBufferProfile(KeyOpFieldsValuesTuple &tuple);
 
@@ -152,6 +154,11 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> m_port_ready_list_ref;
 
     Table m_stateBufferMaximumValueTable;
+
+    // Total buffer the device reports through SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE, in bytes.
+    // Zero when the platform does not report it, in which case no oversubscription check
+    // can be made.
+    sai_uint64_t m_mmuSize = 0;
 
     unique_ptr<CounterNameMapUpdater> m_counterNameMapUpdater;
     unique_ptr<DBConnector> m_countersDb;

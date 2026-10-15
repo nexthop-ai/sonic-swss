@@ -210,7 +210,10 @@ void BufferOrch::initVoqBufferReadyList(Table& table, bool isConfigDb)
 void BufferOrch::initBufferConstants()
 {
     sai_status_t status;
-    sai_attribute_t attr;
+    // Zero the attribute: SAI declares SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE as a u64, but some
+    // implementations only write the u32 member of the value union, which would otherwise leave
+    // the upper half of value.u64 holding whatever was on the stack.
+    sai_attribute_t attr = {};
 
     attr.id = SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE;
 
@@ -222,11 +225,56 @@ void BufferOrch::initBufferConstants()
         return;
     }
 
+    m_mmuSize = attr.value.u64 * 1024;
+
     vector<FieldValueTuple> fvVector;
-    fvVector.emplace_back(make_pair("mmu_size", to_string(attr.value.u64 * 1024)));
+    fvVector.emplace_back(make_pair("mmu_size", to_string(m_mmuSize)));
     m_stateBufferMaximumValueTable.set("global", fvVector);
     SWSS_LOG_NOTICE("Got maximum memory size %" PRIx64 ", exposing to %s|global",
                     attr.value.u64, STATE_BUFFER_MAXIMUM_VALUE_TABLE);
+}
+
+/*
+ * Report a buffer pool sized beyond the buffer the device actually has.
+ *
+ * SAI and the underlying SDK may accept a buffer pool size larger than the buffer available on the
+ * chip. The failure then surfaces much later and indirectly - ports do not come up - with nothing
+ * in the log tying the outage back to the configuration that caused it.
+ *
+ * Only a single value larger than the whole device buffer is reported. That is wrong under any
+ * accounting model, so it cannot produce a false alarm. Sizes are deliberately not summed across
+ * pools: on Broadcom the ingress and egress pools are two views of the same physical memory, and
+ * the shared headroom pool (xoff) is accounted separately again, so a naive total would flag
+ * shipping default configurations. Catching those cases needs per-platform accounting.
+ *
+ * This is diagnostic only - the configuration is still passed down to SAI.
+ */
+void BufferOrch::checkBufferPoolSizeAgainstMmu(const string &pool_name, bool has_size, sai_uint64_t size,
+                                               bool has_xoff, sai_uint64_t xoff)
+{
+    SWSS_LOG_ENTER();
+
+    if (m_mmuSize == 0)
+    {
+        // The platform did not report its total buffer size, so there is nothing to check against.
+        return;
+    }
+
+    if (has_size && size > m_mmuSize)
+    {
+        SWSS_LOG_ERROR("Buffer pool %s is configured with size %" PRIu64 " bytes, which exceeds the %" PRIu64
+                       " bytes of buffer this device has. SAI may accept it and fail later: ports are likely "
+                       "to stay down. Correct BUFFER_POOL|%s in CONFIG_DB.",
+                       pool_name.c_str(), size, m_mmuSize, pool_name.c_str());
+    }
+
+    if (has_xoff && xoff > m_mmuSize)
+    {
+        SWSS_LOG_ERROR("Buffer pool %s is configured with a shared headroom pool (xoff) of %" PRIu64
+                       " bytes, which exceeds the %" PRIu64 " bytes of buffer this device has. SAI may accept "
+                       "it and fail later: ports are likely to stay down. Correct BUFFER_POOL|%s in CONFIG_DB.",
+                       pool_name.c_str(), xoff, m_mmuSize, pool_name.c_str());
+    }
 }
 
 void BufferOrch::initFlexCounterGroupTable(void)
@@ -397,6 +445,10 @@ task_process_status BufferOrch::processBufferPool(KeyOpFieldsValuesTuple &tuple)
     string object_name = kfvKey(tuple);
     string op = kfvOp(tuple);
     string xoff;
+    bool has_size = false;
+    bool has_xoff = false;
+    sai_uint64_t pool_size = 0;
+    sai_uint64_t pool_xoff = 0;
 
     SWSS_LOG_DEBUG("KEY: %s, OP: %s", object_name.c_str(), op.c_str());
 
@@ -427,6 +479,8 @@ task_process_status BufferOrch::processBufferPool(KeyOpFieldsValuesTuple &tuple)
                 attr.id = SAI_BUFFER_POOL_ATTR_SIZE;
                 attr.value.u64 = (uint64_t)stoul(value);
                 attribs.push_back(attr);
+                has_size = true;
+                pool_size = attr.value.u64;
             }
             else if (field == buffer_pool_type_field_name)
             {
@@ -493,6 +547,8 @@ task_process_status BufferOrch::processBufferPool(KeyOpFieldsValuesTuple &tuple)
                 attr.id = SAI_BUFFER_POOL_ATTR_XOFF_SIZE;
                 attribs.push_back(attr);
                 xoff = value;
+                has_xoff = true;
+                pool_xoff = attr.value.u64;
             }
             else
             {
@@ -500,6 +556,11 @@ task_process_status BufferOrch::processBufferPool(KeyOpFieldsValuesTuple &tuple)
                 continue;
             }
         }
+
+        // Report a size the device's buffer cannot hold before applying it: SAI may accept it and
+        // only fail later, silently, when ports try to come up.
+        checkBufferPoolSizeAgainstMmu(object_name, has_size, pool_size, has_xoff, pool_xoff);
+
         if (SAI_NULL_OBJECT_ID != sai_object)
         {
             for (auto &attribute : attribs)
