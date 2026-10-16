@@ -62,7 +62,8 @@ end
 -- Charging less would stretch restoration by the overrun, which is what this
 -- change removes.  A gap that spans a stop/start or an orchagent restart is
 -- not charged at all, because orchagent deletes the baseline whenever a queue
--- is registered or unregistered; the first poll then only records one.
+-- is registered or unregistered; the first poll then only records one.  A
+-- forwarding queue is charged every gap, quiet or not (see below).
 
 -- Iterate through each queue
 local n = table.getn(KEYS)
@@ -97,8 +98,13 @@ for i = n, 1, -1 do
             if pfc_rx_packets_last then
                 pfc_rx_packets_last = tonumber(pfc_rx_packets_last)
 
-                -- Check actual condition of queue being restored from PFC storm
-                if (pfc_rx_packets - pfc_rx_packets_last == 0)
+                -- Check actual condition of queue being restored from PFC storm.
+                -- A forwarding queue ignores the partner's pause, so a partner
+                -- that is congested rather than storming keeps pausing and PFC
+                -- RX never goes quiet.  Forward restores after restoration_time
+                -- regardless; a real storm is detected again once the pause is
+                -- honoured.
+                if ((pfc_rx_packets - pfc_rx_packets_last == 0) or (pfc_wd_action == 'forward'))
                     -- DEBUG CODE START. Uncomment to enable
                     and (debug_storm ~= "enabled")
                     -- DEBUG CODE END.
