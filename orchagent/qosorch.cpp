@@ -1434,7 +1434,7 @@ task_process_status QosOrch::handleSchedulerTable(Consumer& consumer, KeyOpField
                 sai_attr_list.push_back(attr);
             }
             else {
-                SWSS_LOG_ERROR("Unknown field:%s", fvField(*i).c_str());
+                SWSS_LOG_ERROR("Unknown field:%s in %s|%s", fvField(*i).c_str(), qos_map_type_name.c_str(), qos_object_name.c_str());
                 return task_process_status::task_invalid_entry;
             }
         }
