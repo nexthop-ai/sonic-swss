@@ -88,6 +88,13 @@ tests_SOURCES = aclorch_ut.cpp \
                 stporch_ut.cpp \
                 srv6orch_ut.cpp \
                 flexcounter_ut.cpp \
+<<<<<<< HEAD
+=======
+                pfcwdhw_counters_ut.cpp \
+                pfcwdhw_stat_history_ut.cpp \
+                pfcwdhw_timer_range_ut.cpp \
+                pfcwd_counters_ut.cpp \
+>>>>>>> 55e0b5bf ([pfcwdhworch] program saved out-of-range timers after an upgrade and clear stale hardware state)
                 portphyattr_ut.cpp \
 		portphyserdesattr_ut.cpp \
                 counternameupdater_ut.cpp \

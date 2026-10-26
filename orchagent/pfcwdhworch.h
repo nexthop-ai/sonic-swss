@@ -64,6 +64,19 @@ private:
     shared_ptr<DBConnector> m_stateDb;
     shared_ptr<Table> m_pfcWdHwStateTable;
 
+<<<<<<< HEAD
+=======
+    shared_ptr<Table> m_statHistoryTable;
+
+    // Round up user value to nearest valid interval
+    uint32_t roundUpToValidInterval(uint32_t requestedTime, const vector<uint32_t>& validIntervals);
+
+    // Timers saved before an upgrade, outside this hardware's range
+    void recordSavedTimers(const string& key, const vector<FieldValueTuple>& data);
+    uint32_t migrateSavedTimer(const string& key, const string& field, uint32_t value,
+                               uint32_t minTime, uint32_t maxTime);
+
+>>>>>>> 55e0b5bf ([pfcwdhworch] program saved out-of-range timers after an upgrade and clear stale hardware state)
     // Write failure status to STATE_DB
     void writeFailureStatus(const Port& port);
 
@@ -91,6 +104,9 @@ private:
 
     // Ports where hardware watchdog is configured
     std::set<std::string> m_hwWdPorts;
+
+    // Port -> timer field -> out-of-range value found in CONFIG_DB at startup
+    std::map<std::string, std::map<std::string, uint32_t>> m_savedOutOfRangeTimers;
 
     // Port and queue information
     struct PortQueueInfo
