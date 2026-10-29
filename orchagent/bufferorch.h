@@ -146,8 +146,19 @@ private:
     task_process_status processIngressBufferProfileListPost(const PortBufferProfileListTask& task);
     task_process_status processEgressBufferProfileListPost(const PortBufferProfileListTask& task);
 
+    // Release a dropped task's hold on the port-ready barrier (see m_ready_list).
+    void releaseReadyListEntry(const std::string& key);
+
     buffer_table_handler_map m_bufferHandlerMap;
     buffer_table_flush_handler_map m_bufferFlushHandlerMap;
+    // Each buffer pg/queue item stays false until it is applied to SAI. isPortReady(),
+    // and through it PortsOrch::allPortsReady(), is false while any item of that port is
+    // false. INVARIANT: a path that abandons a task without applying it must call
+    // releaseReadyListEntry(), or the barrier never lifts and every orch gated on
+    // allPortsReady() stalls for the lifetime of orchagent.
+    // Keys are not unique across tables: outside voq, BUFFER_PG|Ethernet0|0 and
+    // BUFFER_QUEUE|Ethernet0|0 both key as "Ethernet0:0" and share one entry, so
+    // either table can satisfy the other's hold. Pre-existing, not relied on here.
     std::unordered_map<std::string, bool> m_ready_list;
     std::unordered_map<std::string, std::vector<std::string>> m_port_ready_list_ref;
 

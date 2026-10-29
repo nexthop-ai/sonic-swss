@@ -274,6 +274,18 @@ bool BufferOrch::isPortReady(const std::string& port_name) const
     return result;
 }
 
+void BufferOrch::releaseReadyListEntry(const std::string& key)
+{
+    // Mark the item applied rather than erasing it: m_port_ready_list_ref still
+    // references the key and isPortReady() reads it with at().
+    auto it = m_ready_list.find(key);
+    if (it != m_ready_list.end() && !it->second)
+    {
+        SWSS_LOG_WARN("Buffer task %s was dropped without being applied, releasing its port-ready hold", key.c_str());
+        it->second = true;
+    }
+}
+
 void BufferOrch::clearBufferPoolWatermarkCounterIdList(const sai_object_id_t object_id)
 {
     if (m_isBufferPoolWatermarkCounterIdListGenerated)
@@ -1298,6 +1310,12 @@ void BufferOrch::processQueueBulk(Consumer& consumer)
             {
                 consumer.m_toSync.emplace(kfvKey(task.kofvs), task.kofvs);
             }
+            else if (task_status != task_process_status::task_success)
+            {
+                /* Dropped here and not re-queued. doTask() erased it from m_toSync when
+                 * it was handed to the bulk, so nothing will retry it. */
+                releaseReadyListEntry(kfvKey(task.kofvs));
+            }
         }
 
         bulk.clear();
@@ -1654,6 +1672,12 @@ void BufferOrch::processPriorityGroupBulk(Consumer& consumer)
             if (task_status == task_process_status::task_need_retry)
             {
                 consumer.m_toSync.emplace(kfvKey(task.kofvs), task.kofvs);
+            }
+            else if (task_status != task_process_status::task_success)
+            {
+                /* Dropped here and not re-queued. doTask() erased it from m_toSync when
+                 * it was handed to the bulk, so nothing will retry it. */
+                releaseReadyListEntry(kfvKey(task.kofvs));
             }
         }
 
@@ -2100,11 +2124,21 @@ void BufferOrch::doTask(Consumer &consumer)
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
+        /* Drop a task that will never be applied. Releasing the ready list entry first
+         * is required: nothing retries an erased task, so a pg/queue item left pending
+         * pins allPortsReady() false for the lifetime of orchagent. Must run before the
+         * erase, which invalidates it. Not used for task_success: a pg/queue task
+         * reports success once it is queued for the bulk, before SAI has applied it. */
+        auto dropTask = [&]() {
+            releaseReadyListEntry(kfvKey(it->second));
+            it = consumer.m_toSync.erase(it);
+        };
+
         /* Make sure the handler is initialized for the task */
         if (m_bufferHandlerMap.find(map_type_name) == m_bufferHandlerMap.end())
         {
             SWSS_LOG_ERROR("No handler for key:%s found.", map_type_name.c_str());
-            it = consumer.m_toSync.erase(it);
+            dropTask();
             continue;
         }
 
@@ -2117,11 +2151,11 @@ void BufferOrch::doTask(Consumer &consumer)
                 break;
             case task_process_status::task_invalid_entry:
                 SWSS_LOG_ERROR("Failed to process invalid buffer task");
-                it = consumer.m_toSync.erase(it);
+                dropTask();
                 break;
             case task_process_status::task_failed:
                 SWSS_LOG_ERROR("Failed to process buffer task, drop it");
-                it = consumer.m_toSync.erase(it);
+                dropTask();
                 return;
             case task_process_status::task_need_retry:
                 SWSS_LOG_INFO("Failed to process buffer task, retry it");
@@ -2129,7 +2163,7 @@ void BufferOrch::doTask(Consumer &consumer)
                 break;
             default:
                 SWSS_LOG_ERROR("Invalid task status %d", task_status);
-                it = consumer.m_toSync.erase(it);
+                dropTask();
                 break;
         }
     }

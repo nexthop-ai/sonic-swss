@@ -57,11 +57,31 @@ namespace bufferorch_test
     }
 
     uint32_t _ut_stub_set_pg_count;
+<<<<<<< HEAD
+=======
+    bool _ut_stub_pg_set_fails = false;
+    std::map<sai_object_id_t, sai_object_id_t> _ut_stub_pg_profile_map;
+    std::map<sai_object_id_t, std::vector<sai_object_id_t>> _ut_stub_pg_profile_history;
+>>>>>>> 9e6a38fe ([buffer] release the port-ready hold when a buffer task is dropped)
     sai_status_t _ut_stub_sai_set_ingress_priority_group_attribute(
         _In_ sai_object_id_t ingress_priority_group_id,
         _In_ const sai_attribute_t *attr)
     {
         _ut_stub_set_pg_count++;
+<<<<<<< HEAD
+=======
+        if (_ut_stub_pg_set_fails)
+        {
+            // Simulate an ASIC that rejects the profile, so the bulk reports a
+            // per-object failure and processPriorityGroupPost() drops the task.
+            return SAI_STATUS_FAILURE;
+        }
+        if (attr->id == SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE)
+        {
+            _ut_stub_pg_profile_map[ingress_priority_group_id] = attr->value.oid;
+            _ut_stub_pg_profile_history[ingress_priority_group_id].push_back(attr->value.oid);
+        }
+>>>>>>> 9e6a38fe ([buffer] release the port-ready hold when a buffer task is dropped)
         return pold_sai_buffer_api->set_ingress_priority_group_attribute(ingress_priority_group_id, attr);
     }
 
@@ -1025,4 +1045,116 @@ namespace bufferorch_test
             ASSERT_FALSE(value.empty());
         }
     }
+
+    /*
+     * NOS-7183: a buffer pg/queue task that is dropped without being applied used to
+     * leave its m_ready_list entry pending forever. isPortReady() then stayed false,
+     * which pins PortsOrch::allPortsReady() false for the lifetime of orchagent and
+     * stalls the port state change handler, the flex counters and every other orch
+     * gated on it -- every port on the box reads oper down with no counters.
+     *
+     * The barrier is armed from CONFIG_DB BUFFER_PG when BufferOrch is constructed,
+     * so the rows have to exist before the base fixture builds the orch. None of the
+     * other tests in this file arm it, which is why none of them covered this.
+     */
+    struct BufferOrchReadyListTest : public BufferOrchTest
+    {
+        // A pg index the ports do not have. Reaches the same check in
+        // processPriorityGroup() that a BUFFER_PG entry on a port with no priority
+        // groups at all hits on hardware (a recirculation or voq system port).
+        // Non-static: the build is C++14, where a static constexpr member odr-used
+        // by a gtest macro would need an out-of-class definition to link.
+        const size_t invalidPgIndex = 8;
+        const string invalidPgPort = "Ethernet8";
+        const string validPgPort = "Ethernet12";
+
+        void SetUp() override
+        {
+            swss::DBConnector configDb("CONFIG_DB", 0);
+            Table cfgBufferPgTable(&configDb, CFG_BUFFER_PG_TABLE_NAME);
+            cfgBufferPgTable.set(invalidPgPort + "|" + to_string(invalidPgIndex),
+                                 {{"profile", "ingress_lossy_profile"}});
+            cfgBufferPgTable.set(validPgPort + "|0",
+                                 {{"profile", "ingress_lossy_profile"}});
+
+            BufferOrchTest::SetUp();
+
+            _ut_stub_pg_set_fails = false;
+        }
+
+        void TearDown() override
+        {
+            _ut_stub_pg_set_fails = false;
+            BufferOrchTest::TearDown();
+
+            // the mock db outlives a test, so leaving these behind would arm the
+            // barrier for every later test in this binary
+            swss::DBConnector configDb("CONFIG_DB", 0);
+            Table cfgBufferPgTable(&configDb, CFG_BUFFER_PG_TABLE_NAME);
+            cfgBufferPgTable.del(invalidPgPort + "|" + to_string(invalidPgIndex));
+            cfgBufferPgTable.del(validPgPort + "|0");
+        }
+
+        void PushBufferPg(const string &key)
+        {
+            std::deque<KeyOpFieldsValuesTuple> entries;
+            entries.push_back({key, "SET", {{"profile", "ingress_lossy_profile"}}});
+            auto consumer = dynamic_cast<Consumer *>(gBufferOrch->getExecutor(APP_BUFFER_PG_TABLE_NAME));
+            consumer->addToSync(entries);
+            static_cast<Orch *>(gBufferOrch)->doTask();
+        }
+
+        bool BufferPgTaskPending()
+        {
+            auto consumer = dynamic_cast<Consumer *>(gBufferOrch->getExecutor(APP_BUFFER_PG_TABLE_NAME));
+            return !consumer->m_toSync.empty();
+        }
+    };
+
+    // The task is rejected before it ever reaches SAI (doTask() drop path).
+    TEST_F(BufferOrchReadyListTest, ReadyListReleasedWhenPgIndexIsInvalid)
+    {
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(invalidPgPort, port));
+        // guards against a vacuous pass if the mock platform grows more pgs
+        ASSERT_LE(port.m_priority_group_ids.size(), invalidPgIndex);
+
+        // the seeded CONFIG_DB row holds the port back until the item is applied
+        ASSERT_FALSE(gBufferOrch->isPortReady(invalidPgPort));
+
+        PushBufferPg(invalidPgPort + ":" + to_string(invalidPgIndex));
+
+        // dropped rather than retried, so nothing will ever apply it ...
+        ASSERT_FALSE(BufferPgTaskPending());
+        // ... which means it must not still be holding the barrier
+        ASSERT_TRUE(gBufferOrch->isPortReady(invalidPgPort));
+    }
+
+    // The task passes validation, is handed to the bulk, and SAI rejects it
+    // (processPriorityGroupBulk() drop path). doTask() has already erased it by then.
+    TEST_F(BufferOrchReadyListTest, ReadyListReleasedWhenBulkSetFails)
+    {
+        _hook_sai_apis();
+
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(validPgPort, port));
+        ASSERT_GT(port.m_priority_group_ids.size(), 0U);
+
+        ASSERT_FALSE(gBufferOrch->isPortReady(validPgPort));
+
+        auto setCountBefore = _ut_stub_set_pg_count;
+
+        _ut_stub_pg_set_fails = true;
+        PushBufferPg(validPgPort + ":0");
+        _ut_stub_pg_set_fails = false;
+
+        // the task has to reach SAI for this to be the bulk drop path: without this
+        // the test still passes if validation starts dropping it in doTask() instead,
+        // silently losing the phase 2 coverage it exists for
+        ASSERT_GT(_ut_stub_set_pg_count, setCountBefore);
+
+        ASSERT_FALSE(BufferPgTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(validPgPort));
+    }
+
 }
