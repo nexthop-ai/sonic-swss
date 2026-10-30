@@ -4,6 +4,7 @@
 #include "sai_serialize.h"
 #include "portsorch.h"
 #include <vector>
+#include <algorithm>
 #include <inttypes.h>
 
 #define PFC_WD_QUEUE_STATUS             "PFC_WD_STATUS"
@@ -30,6 +31,7 @@ extern AclOrch * gAclOrch;
 extern sai_port_api_t *sai_port_api;
 extern sai_queue_api_t *sai_queue_api;
 extern sai_buffer_api_t *sai_buffer_api;
+extern sai_acl_api_t *sai_acl_api;
 
 PfcWdActionHandler::PfcWdActionHandler(sai_object_id_t port, sai_object_id_t queue,
         uint8_t queueId, shared_ptr<Table> countersTable):
@@ -83,7 +85,51 @@ void PfcWdActionHandler::commitCounters(bool periodic /* = false */)
 
     PfcWdHwStats hwStats;
 
+<<<<<<< HEAD
     if (!getHwCounters(hwStats))
+=======
+    // See initCounters(): one read of the queue entry serves both consumers.
+    // This path runs once per second for every queue in storm, so the saved
+    // read scales with the number of simultaneous storms.
+    const string queueIdStr = sai_serialize_object_id(m_queue);
+    vector<FieldValueTuple> queueFvs;
+    m_countersTable->get(queueIdStr, queueFvs);
+
+    PfcWdHwStats hwStats = {};
+    const bool readable = getHwCounters(hwStats, queueFvs);
+
+    if (readable && m_baselineValid)
+    {
+        // A restore closes the storm with RX and TX drops read from the SAI, as
+        // initCounters() opens it. On failure each stays the COUNTERS_DB value
+        // already read.
+        bool rxRead = false;
+        bool txDropRead = false;
+        if (!periodic)
+        {
+            rxRead = readRxFromSai(hwStats);
+            txDropRead = readTxDropFromSai(hwStats);
+        }
+
+        seedUnknownBaselines(hwStats, rxRead || m_sampleHasRx, txDropRead || m_sampleHasTxDrop);
+        holdAtBaseline(hwStats);
+
+        // Only a storm with a baseline is charged here; otherwise nothing is
+        // added, and a handler that defers its final count credits it all later.
+        if (!periodic)
+        {
+            addFinalCounters(hwStats);
+        }
+    }
+    else if (readable)
+    {
+        // The first readable sample of a storm that began without one becomes
+        // the baseline, so open it from the SAI as initCounters() would have.
+        readBaselineFromSai(hwStats);
+    }
+
+    if (!readable && periodic)
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
     {
         return;
     }
@@ -263,6 +309,205 @@ PfcWdDlrHandler::~PfcWdDlrHandler(void)
     }
 }
 
+<<<<<<< HEAD
+=======
+// PfcWdAclHandler mitigates a storm with two ACL constructs, which select the
+// mitigated ports differently:
+//
+//   ingress  One shared DROP table, one rule per queue index matching
+//            TC == <index> AND IN_PORTS IN {storming ports}. The rule names its
+//            own ports, so the storm path only edits the IN_PORTS list.
+//
+//   egress   One table per queue index, whose rule matches TC == <index> only.
+//            The mitigated ports are the ports bound to the table, so binding
+//            stays on the storm path. On Broadcom a single table is bound at
+//            switch level instead, with one rule per (port, queue) matching
+//            TC and OUT_PORT; that rule's counter adds to the queue's TX drops.
+
+bool PfcWdAclHandler::useSharedEgressAclTable(void)
+{
+    // Read the environment each time; the DVS tests set it per test case.
+    string platform = getenv("platform") ? getenv("platform") : "";
+
+    return platform == BRCM_PLATFORM_SUBSTRING;
+}
+
+string PfcWdAclHandler::ingressRuleName(uint8_t queueId)
+{
+    return "Rule_PfcWdAclHandler_" + to_string(queueId);
+}
+
+string PfcWdAclHandler::egressTableName(uint8_t queueId)
+{
+    return useSharedEgressAclTable()
+        ? string("EgressTable_PfcWdAclHandler")
+        : "EgressTable_PfcWdAclHandler_" + to_string(queueId);
+}
+
+bool PfcWdAclHandler::ensureAclTable(const string &strTable, bool ingress)
+{
+    if (m_aclTables.find(strTable) != m_aclTables.end())
+    {
+        return true;
+    }
+
+    return createPfcAclTable(strTable, ingress);
+}
+
+bool PfcWdAclHandler::flushQueueId(uint8_t queueId, std::set<sai_object_id_t> &failedQueues)
+{
+    SWSS_LOG_ENTER();
+
+    const string strRule = ingressRuleName(queueId);
+    auto &desired = m_desiredInPorts[queueId];
+
+    // A port that is gone or not physical fails only its own queue.
+    for (auto it = desired.begin(); it != desired.end(); )
+    {
+        Port p;
+        if (!gPortsOrch->getPort(it->first, p))
+        {
+            // Deleted while stormed; its handler's teardown follows.
+            SWSS_LOG_NOTICE("Dropping port oid:0x%" PRIx64 " from ingress PFCWD drop rule %s: "
+                            "port no longer exists", it->first, strRule.c_str());
+            failedQueues.insert(it->second);
+            it = desired.erase(it);
+            continue;
+        }
+        if (p.m_type != Port::PHY)
+        {
+            SWSS_LOG_ERROR("Dropping port oid:0x%" PRIx64 " from ingress PFCWD drop rule %s: "
+                           "not a physical port", it->first, strRule.c_str());
+            failedQueues.insert(it->second);
+            it = desired.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    AclRule *rule = gAclOrch->getAclRule(INGRESS_TABLE_DROP, strRule);
+    std::set<sai_object_id_t> current;
+    if (rule != nullptr)
+    {
+        for (auto p : rule->getInPorts())
+        {
+            current.insert(p);
+        }
+    }
+
+    vector<sai_object_id_t> toAdd, toRemove;
+    for (const auto &kv : desired)
+    {
+        if (current.find(kv.first) == current.end())
+        {
+            toAdd.push_back(kv.first);
+        }
+    }
+    for (auto p : current)
+    {
+        if (desired.find(p) == desired.end())
+        {
+            toRemove.push_back(p);
+        }
+    }
+
+    if (toAdd.empty() && toRemove.empty())
+    {
+        m_failedFlushes.erase(queueId);
+        return true;
+    }
+
+    bool ok = false;
+    try
+    {
+        if (desired.empty())
+        {
+            // A rule with an empty IN_PORTS list would match every port.
+            ok = gAclOrch->removeAclRule(INGRESS_TABLE_DROP, strRule);
+        }
+        else if (rule == nullptr)
+        {
+            ok = ensureAclTable(INGRESS_TABLE_DROP, true);
+            if (ok)
+            {
+                auto newRule = make_shared<AclRulePacket>(gAclOrch, strRule, INGRESS_TABLE_DROP);
+                ok = createPfcAclRule(newRule, queueId, INGRESS_TABLE_DROP, toAdd);
+            }
+        }
+        else
+        {
+            ok = gAclOrch->updateAclRuleInPorts(INGRESS_TABLE_DROP, strRule, toAdd, toRemove);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("Exception while programming ingress PFCWD drop rule %s: %s",
+                       strRule.c_str(), e.what());
+        ok = false;
+    }
+
+    if (ok)
+    {
+        m_failedFlushes.erase(queueId);
+        return true;
+    }
+
+    uint32_t failures = ++m_failedFlushes[queueId];
+    if (failures == 1 || failures % 60 == 0)
+    {
+        SWSS_LOG_ERROR("Failed to program ingress PFCWD drop rule %s (+%zu/-%zu ports, attempt %u)",
+                       strRule.c_str(), toAdd.size(), toRemove.size(), failures);
+    }
+
+    // The rule is unchanged. The ports it should have gained are not mitigated,
+    // so their queues are reported and no longer asked for; removals stay
+    // pending and are retried by the next flush.
+    for (auto p : toAdd)
+    {
+        failedQueues.insert(desired[p]);
+        desired.erase(p);
+    }
+
+    return toRemove.empty();
+}
+
+std::set<sai_object_id_t> PfcWdAclHandler::flush(void)
+{
+    SWSS_LOG_ENTER();
+
+    std::set<sai_object_id_t> failedQueues;
+
+    for (auto it = m_dirtyQueueIds.begin(); it != m_dirtyQueueIds.end(); )
+    {
+        if (flushQueueId(*it, failedQueues))
+        {
+            it = m_dirtyQueueIds.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    return failedQueues;
+}
+
+void PfcWdAclHandler::markInvalid(void)
+{
+    SWSS_LOG_ENTER();
+
+    m_rolledBack = true;
+
+    auto &desired = m_desiredInPorts[getQueueId()];
+    auto it = desired.find(getPort());
+    if (it != desired.end() && it->second == getQueue())
+    {
+        desired.erase(it);
+        m_dirtyQueueIds.insert(getQueueId());
+    }
+}
+
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
 PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
         uint8_t queueId, shared_ptr<Table> countersTable):
     PfcWdLossyHandler(port, queue, queueId, countersTable)
@@ -340,6 +585,7 @@ PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
             return;
         }
         m_strEgressRule = "Egress_Rule_PfcWdAclHandler_" + p.m_alias + "_" + queuestr;
+<<<<<<< HEAD
         m_strEgressTable = "EgressTable_PfcWdAclHandler";
         found = m_aclTables.find(m_strEgressTable);
         if (found == m_aclTables.end())
@@ -384,6 +630,32 @@ PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
                     m_rolledBack = true;
                 }
             }
+=======
+
+        // A queue that storms again before its previous storm's final count
+        // was taken: take it now, so the new storm starts with a fresh rule.
+        finishDeferredEgressRule(m_strEgressRule);
+
+        // A rule still here is one whose removal failed. Its counter holds an
+        // earlier storm's drops, so it is never reused.
+        if (gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule) != nullptr &&
+            !gAclOrch->removeAclRule(m_strEgressTable, m_strEgressRule))
+        {
+            SWSS_LOG_ERROR("Failed to remove stale egress PFCWD drop rule %s", m_strEgressRule.c_str());
+            m_strEgressRule.clear();
+            m_rolledBack = true;
+            return;
+        }
+
+        // The table is bound at switch level on this platform, so the rule
+        // itself selects the port with OUT_PORT.
+        auto newRule = make_shared<AclRulePacket>(gAclOrch, m_strEgressRule, m_strEgressTable);
+        if (!createPfcAclRule(newRule, queueId, m_strEgressTable, vector<sai_object_id_t>{ port }))
+        {
+            SWSS_LOG_ERROR("Failed to create egress PFCWD drop rule %s", m_strEgressRule.c_str());
+            m_rolledBack = true;
+            return;
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
         }
     }
     else
@@ -459,14 +731,14 @@ PfcWdAclHandler::~PfcWdAclHandler(void)
         removeIngressBinding(port);
     }
 
-    if (shared_egress_acl_table)
+    if (shared_egress_acl_table && !m_strEgressRule.empty())
     {
         AclRule* rule = gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule);
         if (rule == nullptr)
         {
             SWSS_LOG_NOTICE("Egress ACL Rule %s does not exist for table %s", m_strEgressRule.c_str(), m_strEgressTable.c_str());
         }
-        else
+        else if (!deferEgressRuleRemoval(gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule)))
         {
             gAclOrch->removeAclRule(m_strEgressTable, m_strEgressRule);
         }
@@ -481,11 +753,207 @@ PfcWdAclHandler::~PfcWdAclHandler(void)
     }
 }
 
+void PfcWdAclHandler::addFinalCounters(PfcWdHwStats& counters)
+{
+    SWSS_LOG_ENTER();
+
+    if (!shared_egress_acl_table)
+    {
+        return;
+    }
+
+    // An egress ACL drop never reaches the queue's drop counter, so add the
+    // drops counted by this handler's own egress rule. If the read fails, the
+    // deferred final count credits them.
+    AclRule *rule = gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule);
+    uint64_t drops = 0;
+    if (rule == nullptr || !rule->hasCounter() || !readRuleDrops(rule, drops))
+    {
+        return;
+    }
+
+    counters.txDropPkt += drops;
+    m_egressDropsCounted = drops;
+}
+
+bool PfcWdAclHandler::readRuleDrops(AclRule *rule, uint64_t &drops)
+{
+    SWSS_LOG_ENTER();
+
+    sai_attribute_t attr;
+    attr.id = SAI_ACL_COUNTER_ATTR_PACKETS;
+
+    sai_status_t status = sai_acl_api->get_acl_counter_attribute(rule->getCounterOid(), 1, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to fetch ACL rule %s counter: %d", rule->getId().c_str(), status);
+        return false;
+    }
+
+    drops = attr.value.u64;
+
+    return true;
+}
+
+bool PfcWdAclHandler::deferEgressRuleRemoval(AclRule *rule)
+{
+    SWSS_LOG_ENTER();
+
+    // The SDK's counter cache can lag the hardware by several seconds while the
+    // port receives PFC, so the count read at restore may miss the storm's last
+    // drops. Stop the rule dropping now and take its final count once the cache
+    // has caught up.
+    static const auto readDelay = std::chrono::seconds(5);
+
+    if (!rule->hasCounter())
+    {
+        return false;
+    }
+
+    sai_attribute_t attr;
+    attr.id = SAI_ACL_ENTRY_ATTR_ADMIN_STATE;
+    attr.value.booldata = false;
+
+    sai_status_t status = sai_acl_api->set_acl_entry_attribute(rule->getOid(), &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to disable egress ACL rule %s: %d", m_strEgressRule.c_str(), status);
+        return false;
+    }
+
+    m_deferredEgressRules[m_strEgressRule] = { m_strEgressTable, sai_serialize_object_id(getQueue()),
+                                               getCountersTable(), m_egressDropsCounted,
+                                               std::chrono::steady_clock::now() + readDelay };
+
+    return true;
+}
+
+void PfcWdAclHandler::finishDeferredEgressRule(const string &ruleName, bool retry /* = false */)
+{
+    SWSS_LOG_ENTER();
+
+    static const uint32_t maxAttempts = 3;
+    static const auto retryDelay = std::chrono::seconds(1);
+
+    auto it = m_deferredEgressRules.find(ruleName);
+    if (it == m_deferredEgressRules.end())
+    {
+        return;
+    }
+
+    auto &deferred = it->second;
+    AclRule *rule = gAclOrch->getAclRule(deferred.table, ruleName);
+    if (rule == nullptr)
+    {
+        m_deferredEgressRules.erase(it);
+        return;
+    }
+
+    uint64_t drops = 0;
+    bool read = readRuleDrops(rule, drops);
+    if (read && drops > deferred.counted)
+    {
+        // Credit the drops the restore-time read missed to the storm just restored.
+        auto stats = PfcWdBaseOrch::getQueueStats(deferred.countersTable, deferred.queueIdStr);
+        stats.txDropPkt += drops - deferred.counted;
+        stats.txDropPktLast += drops - deferred.counted;
+        PfcWdBaseOrch::updateQueueStats(deferred.countersTable, deferred.queueIdStr, stats);
+        deferred.counted = drops;
+    }
+
+    // A failed read or removal is tried again on a later tick, a few times.
+    // Drops credited above are not credited again.
+    bool removed = read && gAclOrch->removeAclRule(deferred.table, ruleName);
+    if (!removed && retry && ++deferred.attempts < maxAttempts)
+    {
+        deferred.due = std::chrono::steady_clock::now() + retryDelay;
+        return;
+    }
+
+    if (!read)
+    {
+        removed = gAclOrch->removeAclRule(deferred.table, ruleName);
+    }
+    if (!removed)
+    {
+        SWSS_LOG_ERROR("Failed to remove egress PFCWD drop rule %s", ruleName.c_str());
+    }
+
+    m_deferredEgressRules.erase(it);
+}
+
+void PfcWdAclHandler::finishDeferredForQueue(sai_object_id_t queue)
+{
+    SWSS_LOG_ENTER();
+
+    const string queueIdStr = sai_serialize_object_id(queue);
+    for (auto it = m_deferredEgressRules.begin(); it != m_deferredEgressRules.end(); )
+    {
+        auto cur = it++;
+        if (cur->second.queueIdStr == queueIdStr)
+        {
+            const string ruleName = cur->first;
+            finishDeferredEgressRule(ruleName);
+        }
+    }
+}
+
+void PfcWdAclHandler::finishDeferred(void)
+{
+    SWSS_LOG_ENTER();
+
+    // The time to remove an egress rule grows with how full the table is, so
+    // bound the time spent per timer tick rather than the number of rules.
+    // Oldest first, at least one per call.
+    static const auto timeBudget = std::chrono::milliseconds(200);
+    static const size_t maxPerCall = 128;
+
+    const auto start = std::chrono::steady_clock::now();
+    vector<pair<std::chrono::steady_clock::time_point, string>> due;
+
+    for (const auto &it : m_deferredEgressRules)
+    {
+        if (it.second.due <= start)
+        {
+            due.emplace_back(it.second.due, it.first);
+        }
+    }
+
+    sort(due.begin(), due.end());
+
+    size_t finished = 0;
+    for (const auto &it : due)
+    {
+        if (finished == maxPerCall ||
+            (finished > 0 && std::chrono::steady_clock::now() - start >= timeBudget))
+        {
+            break;
+        }
+        finishDeferredEgressRule(it.second, true);
+        finished++;
+    }
+}
+
 void PfcWdAclHandler::clear()
 {
     SWSS_LOG_ENTER();
 
+<<<<<<< HEAD
     for (auto& tablepair: m_aclTables)
+=======
+    // Their tables are going away, so take the final counts now.
+    while (!m_deferredEgressRules.empty())
+    {
+        finishDeferredEgressRule(m_deferredEgressRules.begin()->first);
+    }
+
+    // The tables are going away, so any pending IN_PORTS change is moot.
+    m_desiredInPorts.clear();
+    m_dirtyQueueIds.clear();
+    m_failedFlushes.clear();
+
+    for (auto it = m_aclTables.begin(); it != m_aclTables.end(); )
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
     {
         auto& table = tablepair.second;
         gAclOrch->removeAclTable(table.getId());
@@ -590,6 +1058,14 @@ bool PfcWdAclHandler::createPfcAclRule(shared_ptr<AclRulePacket> rule, uint8_t q
 }
 
 std::map<std::string, AclTable> PfcWdAclHandler::m_aclTables;
+<<<<<<< HEAD
+=======
+std::set<std::string> PfcWdAclHandler::m_ownedAclTables;
+std::map<uint8_t, std::map<sai_object_id_t, sai_object_id_t>> PfcWdAclHandler::m_desiredInPorts;
+std::set<uint8_t> PfcWdAclHandler::m_dirtyQueueIds;
+std::map<uint8_t, uint32_t> PfcWdAclHandler::m_failedFlushes;
+std::map<std::string, PfcWdAclHandler::DeferredEgressRule> PfcWdAclHandler::m_deferredEgressRules;
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
 
 PfcWdLossyHandler::PfcWdLossyHandler(sai_object_id_t port, sai_object_id_t queue,
         uint8_t queueId, shared_ptr<Table> countersTable):

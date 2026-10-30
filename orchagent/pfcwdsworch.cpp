@@ -384,6 +384,10 @@ void PfcWdSwOrch<DropHandler, ForwardHandler>::unregisterFromWdDb(const Port& po
 
         m_entryMap.erase(queueId);
 
+        // Before the clean up below, so a deferred final count cannot write
+        // the queue's stats back afterwards.
+        DropHandler::finishDeferredForQueue(queueId);
+
         // Clean up
         string countersKey = this->getCountersTable()->getTableName() + this->getCountersTable()->getTableNameSeparator() + sai_serialize_object_id(queueId);
         this->getCountersDb()->hdel(countersKey, {"PFC_WD_DETECTION_TIME", "PFC_WD_RESTORATION_TIME", "PFC_WD_ACTION", "PFC_WD_STATUS"});
@@ -664,6 +668,14 @@ void PfcWdSwOrch<DropHandler, ForwardHandler>::doTask(SelectableTimer &timer)
         }
     }
 
+<<<<<<< HEAD
+=======
+    // Backstop: bounds how long a queued change can sit unapplied if some
+    // path fails to flush explicitly.
+    flushPendingActions();
+
+    DropHandler::finishDeferred();
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
 }
 
 template <typename DropHandler, typename ForwardHandler>

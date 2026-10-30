@@ -4100,8 +4100,9 @@ void AclOrch::initDefaultTableTypes(const string& platform, const string& sub_pl
             .build()
     );
 
-    // Use SAI_ACL_BIND_POINT_TYPE_SWITCH in BRCM DNX platforms to use shared egress ACL table for PFCWD.
-    if (platform == BRCM_PLATFORM_SUBSTRING && sub_platform == BRCM_DNX_PLATFORM_SUBSTRING)
+    // Broadcom PFCWD uses one switch-bound egress table with a rule per (port, queue),
+    // so each mitigated queue's drops have their own ACL counter.
+    if (platform == BRCM_PLATFORM_SUBSTRING)
     {
         addAclTableType(
             builder.withName(TABLE_TYPE_PFCWD)
@@ -5058,6 +5059,24 @@ bool AclOrch::addAclTable(AclTable &newTable)
     newTable.addMandatoryActions();
     if (createBindAclTable(newTable, table_oid))
     {
+<<<<<<< HEAD
+=======
+        // We use SAI_ACL_BIND_POINT_TYPE_SWITCH for PFCWD table in Broadcom platforms.
+        // This bind type requires to bind the table to switch. Mark the table
+        // before caching it, otherwise removeAclTable() never unbinds it and the
+        // SAI remove fails with OBJECT_IN_USE.
+        string platform = getenv("platform") ? getenv("platform") : "";
+        if (platform == BRCM_PLATFORM_SUBSTRING &&
+            newTable.type.getName() == TABLE_TYPE_PFCWD)
+        {
+            if(!gSwitchOrch->bindAclTableToSwitch(ACL_STAGE_EGRESS, newTable.getOid()))
+            {
+                return false;
+            }
+            newTable.bindToSwitch = true;
+        }
+
+>>>>>>> cb949ebc (NOS-20722: [pfcwd] count egress ACL drops in the Broadcom software watchdog's TX drop stats (#1627))
         m_AclTables[table_oid] = newTable;
         SWSS_LOG_NOTICE("Created ACL table %s oid:%" PRIx64,
                 newTable.id.c_str(), table_oid);
