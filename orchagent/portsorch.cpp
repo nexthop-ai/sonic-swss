@@ -833,6 +833,20 @@ PortsOrch::PortsOrch(DBConnector *db, DBConnector *stateDb, vector<table_name_wi
     m_queueCounterCapabilitiesTable = unique_ptr<Table>(new Table(m_state_db.get(), STATE_QUEUE_COUNTER_CAPABILITIES_NAME));
     m_portCounterCapabilitiesTable = unique_ptr<Table>(new Table(m_state_db.get(), STATE_PORT_COUNTER_CAPABILITIES_NAME));
 
+    if (!m_isWarmRestoreStage)
+    {
+        std::vector<std::string> operErrKeys;
+        m_portOpErrTable.getKeys(operErrKeys);
+        for (const auto &operErrKey : operErrKeys)
+        {
+            m_portOpErrTable.del(operErrKey);
+        }
+        if (!operErrKeys.empty())
+        {
+            SWSS_LOG_NOTICE("Scrubbed %zu stale port oper error entries", operErrKeys.size());
+        }
+    }
+
     initGearbox();
 
     string queueWmSha, pgWmSha, portRateSha, nvdaPortTrimSha, portFlrSha, gbPortRateSha;
@@ -4021,6 +4035,11 @@ void PortsOrch::updateDbPortFlapCount(Port& port, sai_port_oper_status_t pstatus
 void PortsOrch::updateDbPortOperError(Port& port, PortOperErrorEvent *pevent)
 {
     SWSS_LOG_ENTER();
+    if (pevent == nullptr)
+    {
+        m_portOpErrTable.del(port.m_alias);
+        return;
+    }
 
     auto time = pevent->getEventTime();
     auto key = pevent->getDbKey();
@@ -10008,6 +10027,8 @@ void PortsOrch::handleNotification(NotificationConsumer &consumer, KeyOpFieldsVa
             updatePortOperStatus(port, status);
             if (status == SAI_PORT_OPER_STATUS_UP)
             {
+                updatePortErrorStatus(port, port_oper_err);
+
                 sai_uint32_t speed;
                 if (getPortOperSpeed(port, speed))
                 {
@@ -10078,6 +10099,21 @@ void PortsOrch::updatePortErrorStatus(Port &port, sai_port_error_status_t errsta
     string db_port_error_name;
     PortOperErrorEvent *portOperErrorEvent = nullptr;
     size_t error_count = PortOperErrorEvent::db_key_errors.size();
+
+    if (errstatus == SAI_PORT_ERROR_STATUS_CLEAR)
+    {
+        if (port.m_oper_error_status != SAI_PORT_ERROR_STATUS_CLEAR)
+        {
+            SWSS_LOG_NOTICE("Port %s error state cleared from 0x%" PRIx32,
+                            port.m_alias.c_str(),
+                            port.m_oper_error_status);
+
+            port.m_oper_error_status = errstatus;
+        }
+
+        updateDbPortOperError(port, nullptr);
+        return;
+    }
 
     SWSS_LOG_NOTICE("Port %s error state set from 0x%" PRIx32 "-> 0x%" PRIx32,
                         port.m_alias.c_str(),
