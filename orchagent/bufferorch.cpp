@@ -286,6 +286,14 @@ void BufferOrch::releaseReadyListEntry(const std::string& key)
     }
 }
 
+bool BufferOrch::isReadyListEntryApplied(const std::string& key) const
+{
+    const auto it = m_ready_list.find(key);
+    // A key that is not tracked -- added at run time rather than read from CONFIG_DB at
+    // construction -- never held a port back, so there is nothing left to apply for it.
+    return it == m_ready_list.end() || it->second;
+}
+
 void BufferOrch::clearBufferPoolWatermarkCounterIdList(const sai_object_id_t object_id)
 {
     if (m_isBufferPoolWatermarkCounterIdListGenerated)
@@ -990,8 +998,14 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
         {
             if (m_partiallyAppliedQueues.find(key) == m_partiallyAppliedQueues.end())
             {
-                SWSS_LOG_INFO("Skip setting buffer queue %s to %s since it is not changed", key.c_str(), buffer_profile_name.c_str());
-                return task_process_status::task_success;
+                // m_partiallyAppliedQueues only covers the locked-queue retry below; a
+                // task re-queued by processQueuePost() on a retryable SAI status is not
+                // in it and would be skipped here, leaving its entry pending forever.
+                if (isReadyListEntryApplied(key))
+                {
+                    SWSS_LOG_INFO("Skip setting buffer queue %s to %s since it is not changed", key.c_str(), buffer_profile_name.c_str());
+                    return task_process_status::task_success;
+                }
             }
             else
             {
@@ -1375,7 +1389,13 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
         }
 
         if (doesObjectExist(m_buffer_type_maps, APP_BUFFER_PG_TABLE_NAME, key, buffer_profile_field_name, old_buffer_profile_name)
-            && (old_buffer_profile_name == buffer_profile_name))
+            && (old_buffer_profile_name == buffer_profile_name)
+            // The reference is recorded below, before the task is handed to the bulk, so
+            // a task re-queued by processPriorityGroupPost() on a retryable SAI status
+            // arrives here looking unchanged. Skipping it would return task_success
+            // without reaching the bulk again: doTask() then erases the task and the
+            // ready list entry stays pending for the lifetime of orchagent.
+            && isReadyListEntryApplied(key))
         {
             SWSS_LOG_INFO("Skip setting buffer priority group %s to %s since it is not changed", key.c_str(), buffer_profile_name.c_str());
             return task_process_status::task_success;

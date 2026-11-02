@@ -148,6 +148,9 @@ private:
 
     // Release a dropped task's hold on the port-ready barrier (see m_ready_list).
     void releaseReadyListEntry(const std::string& key);
+    // False while a tracked item is still waiting to be applied to SAI. An untracked
+    // key is reported applied: it holds nothing back (see m_ready_list).
+    bool isReadyListEntryApplied(const std::string& key) const;
 
     buffer_table_handler_map m_bufferHandlerMap;
     buffer_table_flush_handler_map m_bufferFlushHandlerMap;

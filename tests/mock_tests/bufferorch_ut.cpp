@@ -57,31 +57,22 @@ namespace bufferorch_test
     }
 
     uint32_t _ut_stub_set_pg_count;
-<<<<<<< HEAD
-=======
     bool _ut_stub_pg_set_fails = false;
-    std::map<sai_object_id_t, sai_object_id_t> _ut_stub_pg_profile_map;
-    std::map<sai_object_id_t, std::vector<sai_object_id_t>> _ut_stub_pg_profile_history;
->>>>>>> 9e6a38fe ([buffer] release the port-ready hold when a buffer task is dropped)
+    // Which failure the ASIC reports. SAI_STATUS_FAILURE is handled as task_failed;
+    // SAI_STATUS_INSUFFICIENT_RESOURCES and friends are handled as task_need_retry,
+    // which takes the re-queue path instead of the drop path.
+    sai_status_t _ut_stub_pg_set_status = SAI_STATUS_FAILURE;
     sai_status_t _ut_stub_sai_set_ingress_priority_group_attribute(
         _In_ sai_object_id_t ingress_priority_group_id,
         _In_ const sai_attribute_t *attr)
     {
         _ut_stub_set_pg_count++;
-<<<<<<< HEAD
-=======
         if (_ut_stub_pg_set_fails)
         {
             // Simulate an ASIC that rejects the profile, so the bulk reports a
             // per-object failure and processPriorityGroupPost() drops the task.
-            return SAI_STATUS_FAILURE;
+            return _ut_stub_pg_set_status;
         }
-        if (attr->id == SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE)
-        {
-            _ut_stub_pg_profile_map[ingress_priority_group_id] = attr->value.oid;
-            _ut_stub_pg_profile_history[ingress_priority_group_id].push_back(attr->value.oid);
-        }
->>>>>>> 9e6a38fe ([buffer] release the port-ready hold when a buffer task is dropped)
         return pold_sai_buffer_api->set_ingress_priority_group_attribute(ingress_priority_group_id, attr);
     }
 
@@ -133,11 +124,19 @@ namespace bufferorch_test
     }
 
     uint32_t _ut_stub_set_queue_count;
+    bool _ut_stub_queue_set_fails = false;
+    sai_status_t _ut_stub_queue_set_status = SAI_STATUS_FAILURE;
     sai_status_t _ut_stub_sai_set_queue_attribute(
         _In_ sai_object_id_t queue_id,
         _In_ const sai_attribute_t *attr)
     {
         _ut_stub_set_queue_count++;
+        if (_ut_stub_queue_set_fails)
+        {
+            // Simulate an ASIC that rejects the profile, so the bulk reports a
+            // per-object failure and processQueuePost() drops the task.
+            return _ut_stub_queue_set_status;
+        }
         return pold_sai_queue_api->set_queue_attribute(queue_id, attr);
     }
 
@@ -1067,6 +1066,19 @@ namespace bufferorch_test
         const size_t invalidPgIndex = 8;
         const string invalidPgPort = "Ethernet8";
         const string validPgPort = "Ethernet12";
+        // Queue equivalents. Kept on different ports/indices from the pg ones: outside
+        // voq both tables key into m_ready_list the same way, so BUFFER_PG|X|0 and
+        // BUFFER_QUEUE|X|0 would share one entry and each could mask the other.
+        // Not 8: the vs switch gives a port 20 queues but only 8 priority groups, so
+        // the index that is out of range for a pg is a valid queue. The ASSERT_LE in
+        // the test is what keeps this honest if that count ever changes again.
+        const size_t invalidQueueIndex = 64;
+        const string invalidQueuePort = "Ethernet16";
+        const string validQueuePort = "Ethernet20";
+        // A single key naming two ports. initBufferReadyList() gives both a reference
+        // to the one m_ready_list entry, so dropping it has to free both.
+        const string multiPortA = "Ethernet24";
+        const string multiPortB = "Ethernet28";
 
         void SetUp() override
         {
@@ -1076,15 +1088,29 @@ namespace bufferorch_test
                                  {{"profile", "ingress_lossy_profile"}});
             cfgBufferPgTable.set(validPgPort + "|0",
                                  {{"profile", "ingress_lossy_profile"}});
+            cfgBufferPgTable.set(multiPortA + "," + multiPortB + "|" + to_string(invalidPgIndex),
+                                 {{"profile", "ingress_lossy_profile"}});
+
+            Table cfgBufferQueueTable(&configDb, CFG_BUFFER_QUEUE_TABLE_NAME);
+            cfgBufferQueueTable.set(invalidQueuePort + "|" + to_string(invalidQueueIndex),
+                                    {{"profile", "ingress_lossy_profile"}});
+            cfgBufferQueueTable.set(validQueuePort + "|0",
+                                    {{"profile", "ingress_lossy_profile"}});
 
             BufferOrchTest::SetUp();
 
             _ut_stub_pg_set_fails = false;
+            _ut_stub_queue_set_fails = false;
+            _ut_stub_pg_set_status = SAI_STATUS_FAILURE;
+            _ut_stub_queue_set_status = SAI_STATUS_FAILURE;
         }
 
         void TearDown() override
         {
             _ut_stub_pg_set_fails = false;
+            _ut_stub_queue_set_fails = false;
+            _ut_stub_pg_set_status = SAI_STATUS_FAILURE;
+            _ut_stub_queue_set_status = SAI_STATUS_FAILURE;
             BufferOrchTest::TearDown();
 
             // the mock db outlives a test, so leaving these behind would arm the
@@ -1093,6 +1119,10 @@ namespace bufferorch_test
             Table cfgBufferPgTable(&configDb, CFG_BUFFER_PG_TABLE_NAME);
             cfgBufferPgTable.del(invalidPgPort + "|" + to_string(invalidPgIndex));
             cfgBufferPgTable.del(validPgPort + "|0");
+            cfgBufferPgTable.del(multiPortA + "," + multiPortB + "|" + to_string(invalidPgIndex));
+            Table cfgBufferQueueTable(&configDb, CFG_BUFFER_QUEUE_TABLE_NAME);
+            cfgBufferQueueTable.del(invalidQueuePort + "|" + to_string(invalidQueueIndex));
+            cfgBufferQueueTable.del(validQueuePort + "|0");
         }
 
         void PushBufferPg(const string &key)
@@ -1108,6 +1138,28 @@ namespace bufferorch_test
         {
             auto consumer = dynamic_cast<Consumer *>(gBufferOrch->getExecutor(APP_BUFFER_PG_TABLE_NAME));
             return !consumer->m_toSync.empty();
+        }
+
+        void PushBufferQueue(const string &key)
+        {
+            std::deque<KeyOpFieldsValuesTuple> entries;
+            entries.push_back({key, "SET", {{"profile", "ingress_lossy_profile"}}});
+            auto consumer = dynamic_cast<Consumer *>(gBufferOrch->getExecutor(APP_BUFFER_QUEUE_TABLE_NAME));
+            consumer->addToSync(entries);
+            static_cast<Orch *>(gBufferOrch)->doTask();
+        }
+
+        bool BufferQueueTaskPending()
+        {
+            auto consumer = dynamic_cast<Consumer *>(gBufferOrch->getExecutor(APP_BUFFER_QUEUE_TABLE_NAME));
+            return !consumer->m_toSync.empty();
+        }
+
+        // Run another pass over whatever is already queued, without adding anything.
+        // A task the bulk re-queued on a retryable status is processed on this pass.
+        void RunBufferTasks()
+        {
+            static_cast<Orch *>(gBufferOrch)->doTask();
         }
     };
 
@@ -1157,4 +1209,116 @@ namespace bufferorch_test
         ASSERT_TRUE(gBufferOrch->isPortReady(validPgPort));
     }
 
+    // Queue equivalent of the pg index case: rejected in doTask() before reaching SAI.
+    TEST_F(BufferOrchReadyListTest, ReadyListReleasedWhenQueueIndexIsInvalid)
+    {
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(invalidQueuePort, port));
+        // guards against a vacuous pass if the mock platform grows more queues
+        ASSERT_LE(port.m_queue_ids.size(), invalidQueueIndex);
+
+        ASSERT_FALSE(gBufferOrch->isPortReady(invalidQueuePort));
+
+        PushBufferQueue(invalidQueuePort + ":" + to_string(invalidQueueIndex));
+
+        ASSERT_FALSE(BufferQueueTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(invalidQueuePort));
+    }
+
+    // processQueueBulk() drop path. Same shape as the pg bulk case, and the reason it
+    // matters: doTask() reports success once a queue task is handed to the bulk, so a
+    // later SAI rejection drops a task nothing will retry.
+    TEST_F(BufferOrchReadyListTest, ReadyListReleasedWhenQueueBulkSetFails)
+    {
+        _hook_sai_apis();
+
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort(validQueuePort, port));
+        ASSERT_GT(port.m_queue_ids.size(), 0U);
+
+        ASSERT_FALSE(gBufferOrch->isPortReady(validQueuePort));
+
+        auto setCountBefore = _ut_stub_set_queue_count;
+
+        _ut_stub_queue_set_fails = true;
+        PushBufferQueue(validQueuePort + ":0");
+        _ut_stub_queue_set_fails = false;
+
+        // the task has to reach SAI for this to be the bulk drop path
+        ASSERT_GT(_ut_stub_set_queue_count, setCountBefore);
+
+        ASSERT_FALSE(BufferQueueTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(validQueuePort));
+    }
+
+    // One key can name several ports, and they share a single m_ready_list entry, so a
+    // drop has to free every port referencing it -- not just the one that failed.
+    TEST_F(BufferOrchReadyListTest, ReadyListReleasedForMultiPortKey)
+    {
+        ASSERT_FALSE(gBufferOrch->isPortReady(multiPortA));
+        ASSERT_FALSE(gBufferOrch->isPortReady(multiPortB));
+
+        PushBufferPg(multiPortA + "," + multiPortB + ":" + to_string(invalidPgIndex));
+
+        ASSERT_FALSE(BufferPgTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(multiPortA));
+        ASSERT_TRUE(gBufferOrch->isPortReady(multiPortB));
+    }
+
+    // A retryable SAI status takes the re-queue path, not the drop path, so the task
+    // comes back for another pass. processPriorityGroup() recorded the profile reference
+    // before handing the task to the bulk, so on that pass the entry looks unchanged:
+    // without the ready list guard the "not changed" skip returns task_success, doTask()
+    // erases the task without it ever reaching the bulk again, and the entry stays
+    // pending for the lifetime of orchagent -- the same latch this suite covers for the
+    // drop paths, reached through the path that is supposed to recover.
+    TEST_F(BufferOrchReadyListTest, PgReadyListAppliedAfterRetryableSaiFailure)
+    {
+        _hook_sai_apis();
+
+        ASSERT_FALSE(gBufferOrch->isPortReady(validPgPort));
+
+        _ut_stub_pg_set_fails = true;
+        _ut_stub_pg_set_status = SAI_STATUS_INSUFFICIENT_RESOURCES;
+        PushBufferPg(validPgPort + ":0");
+
+        // a retryable status must keep the task queued rather than drop it, and must not
+        // release the entry: the item is still expected to be applied
+        ASSERT_TRUE(BufferPgTaskPending());
+        ASSERT_FALSE(gBufferOrch->isPortReady(validPgPort));
+
+        // the ASIC now accepts it, so the retry has to reach SAI a second time
+        _ut_stub_pg_set_fails = false;
+        auto setCountBefore = _ut_stub_set_pg_count;
+        RunBufferTasks();
+        ASSERT_GT(_ut_stub_set_pg_count, setCountBefore);
+
+        ASSERT_FALSE(BufferPgTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(validPgPort));
+    }
+
+    // Queue equivalent. m_partiallyAppliedQueues bypasses the skip only for the
+    // locked-queue retry inside processQueue(); a task re-queued by processQueuePost()
+    // is not in that set, so it needs the ready list guard as well.
+    TEST_F(BufferOrchReadyListTest, QueueReadyListAppliedAfterRetryableSaiFailure)
+    {
+        _hook_sai_apis();
+
+        ASSERT_FALSE(gBufferOrch->isPortReady(validQueuePort));
+
+        _ut_stub_queue_set_fails = true;
+        _ut_stub_queue_set_status = SAI_STATUS_INSUFFICIENT_RESOURCES;
+        PushBufferQueue(validQueuePort + ":0");
+
+        ASSERT_TRUE(BufferQueueTaskPending());
+        ASSERT_FALSE(gBufferOrch->isPortReady(validQueuePort));
+
+        _ut_stub_queue_set_fails = false;
+        auto setCountBefore = _ut_stub_set_queue_count;
+        RunBufferTasks();
+        ASSERT_GT(_ut_stub_set_queue_count, setCountBefore);
+
+        ASSERT_FALSE(BufferQueueTaskPending());
+        ASSERT_TRUE(gBufferOrch->isPortReady(validQueuePort));
+    }
 }
