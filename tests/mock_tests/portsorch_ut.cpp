@@ -7055,4 +7055,203 @@ TEST_F(PfcWdHwOrchTest, SAIFailureQueueDldr)
     resetPfcWdFailureFlags();
 }
 
+namespace pt_unsupported_bulk
+{
+    // First lane each create_ports entry must carry, in bulk order. Only the first checkedEntries
+    // entries are read: that many exist even when PortsOrch drops the entries of ports with Path
+    // Tracing fields, so a short array is detected without reading past its end.
+    static std::vector<uint32_t> expectedFirstLanes;
+    static uint32_t checkedEntries = 0;
+    static uint32_t createCalls = 0;
+    static uint32_t nullAttrCalls = 0;
+    static uint32_t misalignedCalls = 0;
+    // Path Tracing attributes seen in the checked entries; none may reach SAI on this switch
+    static uint32_t ptAttrs = 0;
+
+    static sai_status_t ut_create_ports(
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t object_count,
+        _In_ const uint32_t *attr_count,
+        _In_ const sai_attribute_t **attr_list,
+        _In_ sai_bulk_op_error_mode_t mode,
+        _Out_ sai_object_id_t *object_id,
+        _Out_ sai_status_t *object_statuses)
+    {
+        createCalls++;
+
+        // sairedis rejects this the same way: "bulkCreate: parameter attr_count is NULL"
+        if (attr_count == nullptr || attr_list == nullptr)
+        {
+            nullAttrCalls++;
+            return SAI_STATUS_INVALID_PARAMETER;
+        }
+
+        for (uint32_t i = 0; i < std::min(object_count, checkedEntries); i++)
+        {
+            uint32_t firstLane = UINT32_MAX;
+            for (uint32_t j = 0; j < attr_count[i]; j++)
+            {
+                const auto &attr = attr_list[i][j];
+                if (attr.id == SAI_PORT_ATTR_HW_LANE_LIST && attr.value.u32list.count > 0 && firstLane == UINT32_MAX)
+                {
+                    firstLane = attr.value.u32list.list[0];
+                }
+                if (attr.id == SAI_PORT_ATTR_PATH_TRACING_INTF ||
+                    attr.id == SAI_PORT_ATTR_PATH_TRACING_TIMESTAMP_TYPE ||
+                    attr.id == SAI_PORT_ATTR_TAM_OBJECT)
+                {
+                    ptAttrs++;
+                }
+            }
+
+            if (firstLane != expectedFirstLanes.at(i))
+            {
+                misalignedCalls++;
+                return SAI_STATUS_FAILURE;
+            }
+        }
+
+        return pold_sai_port_api->create_ports(
+            switch_id, object_count, attr_count, attr_list, mode, object_id, object_statuses
+        );
+    }
+
+    static void reset()
+    {
+        expectedFirstLanes.clear();
+        checkedEntries = 0;
+        createCalls = 0;
+        nullAttrCalls = 0;
+        misalignedCalls = 0;
+        ptAttrs = 0;
+    }
+}
+
+// Own test suite, so the init bulk test (first in the suite) starts from a VS switch that only has the
+// SAI default ports
+struct PortsOrchPathTracingUnsupportedTest : public PortsOrchTest
+{
+    void SetUp() override
+    {
+        PortsOrchTest::SetUp();
+
+        pt_unsupported_bulk::reset();
+        _hook_sai_port_api();
+        ut_sai_port_api.create_ports = pt_unsupported_bulk::ut_create_ports;
+
+        gPortsOrch->m_isPathTracingSupported = false;
+    }
+
+    void TearDown() override
+    {
+        _unhook_sai_port_api();
+        cleanupPortsBestEffort(gPortsOrch);
+
+        PortsOrchTest::TearDown();
+    }
+};
+
+// In the init bulk, ports with Path Tracing fields must keep their own create_ports entry: with
+// one entry missing, every later port gets the next port's attributes and SAI reads past the end
+// of the arrays.
+TEST_F(PortsOrchPathTracingUnsupportedTest, InitBulkCreateKeepsAttributesAligned)
+{
+    const uint32_t portCount = 8;
+    const uint32_t ptPortCount = 2;
+    auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+
+    // 4-lane ports that differ from the SAI default ports, so init creates all of them in one bulk.
+    // The bulk is ordered by lanes, and the ports with Path Tracing fields come first.
+    for (uint32_t n = 0; n < portCount; n++)
+    {
+        std::vector<FieldValueTuple> fvs = {
+            { "alias", "etp" + std::to_string(n + 1) },
+            { "index", std::to_string(n + 1) },
+            { "lanes", std::to_string(n * 4) + "," + std::to_string(n * 4 + 1) + "," +
+                       std::to_string(n * 4 + 2) + "," + std::to_string(n * 4 + 3) },
+            { "speed", "100000" }
+        };
+        if (n == 0)
+        {
+            fvs.emplace_back("pt_interface_id", "100");
+        }
+        if (n == 1)
+        {
+            fvs.emplace_back("pt_timestamp_template", "template2");
+        }
+        portTable.set(FRONT_PANEL_PORT_PREFIX + std::to_string(n * 4), fvs);
+        pt_unsupported_bulk::expectedFirstLanes.push_back(n * 4);
+    }
+    portTable.set("PortConfigDone", { { "count", std::to_string(portCount) } });
+    pt_unsupported_bulk::checkedEntries = portCount - ptPortCount;
+
+    gPortsOrch->addExistingData(&portTable);
+    static_cast<Orch*>(gPortsOrch)->doTask();
+
+    ASSERT_EQ(pt_unsupported_bulk::misalignedCalls, 0u);
+    ASSERT_EQ(pt_unsupported_bulk::ptAttrs, 0u);
+    ASSERT_EQ(gPortsOrch->getPortConfigState(), PortsOrch::PORT_CONFIG_DONE);
+
+    // Every port exists in SAI with its own lanes, including the entries the create_ports hook did not read
+    for (uint32_t n = 0; n < portCount; n++)
+    {
+        Port p;
+        ASSERT_TRUE(gPortsOrch->getPort(FRONT_PANEL_PORT_PREFIX + std::to_string(n * 4), p));
+
+        std::vector<uint32_t> lanes(8);
+        sai_attribute_t attr;
+        attr.id = SAI_PORT_ATTR_HW_LANE_LIST;
+        attr.value.u32list.count = static_cast<uint32_t>(lanes.size());
+        attr.value.u32list.list = lanes.data();
+        ASSERT_EQ(pold_sai_port_api->get_port_attribute(p.m_port_id, 1, &attr), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(attr.value.u32list.count, 4u);
+        ASSERT_EQ(lanes[0], n * 4);
+    }
+}
+
+
+// A port added at runtime with Path Tracing fields on a switch without Path Tracing is created,
+// and the fields are ignored.
+TEST_F(PortsOrchPathTracingUnsupportedTest, RuntimePortCreateIgnoresPathTracingFields)
+{
+    auto portTable = Table(m_app_db.get(), APP_PORT_TABLE_NAME);
+    auto consumer = dynamic_cast<Consumer*>(gPortsOrch->getExecutor(APP_PORT_TABLE_NAME));
+
+    for (const auto &cit : defaultPortList)
+    {
+        portTable.set(cit.first, cit.second);
+    }
+    portTable.set("PortConfigDone", { { "count", std::to_string(defaultPortList.size()) } });
+    gPortsOrch->addExistingData(&portTable);
+    static_cast<Orch*>(gPortsOrch)->doTask();
+    ASSERT_EQ(gPortsOrch->getPortConfigState(), PortsOrch::PORT_CONFIG_DONE);
+
+    // Remove a port, then add it back with Path Tracing fields
+    const auto alias = defaultPortList.begin()->first;
+    Port p;
+    consumer->addToSync(std::deque<KeyOpFieldsValuesTuple>{ { alias, DEL_COMMAND, { } } });
+    static_cast<Orch*>(gPortsOrch)->doTask();
+    ASSERT_FALSE(gPortsOrch->getPort(alias, p));
+
+    auto fvs = defaultPortList.at(alias);
+    for (const auto &fv : fvs)
+    {
+        if (fvField(fv) == "lanes")
+        {
+            pt_unsupported_bulk::expectedFirstLanes.push_back(static_cast<uint32_t>(std::stoul(fvValue(fv))));
+        }
+    }
+    ASSERT_EQ(pt_unsupported_bulk::expectedFirstLanes.size(), 1u);
+    pt_unsupported_bulk::checkedEntries = 1;
+
+    fvs.emplace_back("pt_interface_id", "100");
+    fvs.emplace_back("pt_timestamp_template", "template2");
+    consumer->addToSync(std::deque<KeyOpFieldsValuesTuple>{ { alias, SET_COMMAND, fvs } });
+    static_cast<Orch*>(gPortsOrch)->doTask();
+
+    ASSERT_EQ(pt_unsupported_bulk::nullAttrCalls, 0u);
+    ASSERT_EQ(pt_unsupported_bulk::misalignedCalls, 0u);
+    ASSERT_EQ(pt_unsupported_bulk::ptAttrs, 0u);
+    ASSERT_TRUE(gPortsOrch->getPort(alias, p));
+}
 }

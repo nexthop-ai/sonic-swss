@@ -1430,16 +1430,17 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
             attrList.push_back(attr);
         }
 
-        if (cit.pt_intf_id.is_set)
+        // An unsupported Path Tracing field is skipped, not the port: every port needs its attribute
+        // entry below, or the arrays passed to create_ports no longer line up with portList.
+        if (cit.pt_intf_id.is_set && !m_isPathTracingSupported)
         {
-            if (!m_isPathTracingSupported)
-            {
-                SWSS_LOG_WARN(
-                    "Failed to set Path Tracing Interface ID: Path Tracing is not supported by the switch"
-                );
-                continue;
-            }
-
+            SWSS_LOG_WARN(
+                "Failed to set Path Tracing Interface ID on port %s: Path Tracing is not supported by the switch",
+                cit.key.c_str()
+            );
+        }
+        else if (cit.pt_intf_id.is_set)
+        {
             /*
              * First, let's check the Path Tracing Interface ID configured for the port.
              *
@@ -1484,16 +1485,15 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
             attrList.push_back(attr);
         }
 
-        if (cit.pt_timestamp_template.is_set)
+        if (cit.pt_timestamp_template.is_set && !m_isPathTracingSupported)
         {
-            if (!m_isPathTracingSupported)
-            {
-                SWSS_LOG_WARN(
-                    "Failed to set Path Tracing Timestamp Template: Path Tracing is not supported by the switch"
-                );
-                continue;
-            }
-
+            SWSS_LOG_WARN(
+                "Failed to set Path Tracing Timestamp Template on port %s: Path Tracing is not supported by the switch",
+                cit.key.c_str()
+            );
+        }
+        else if (cit.pt_timestamp_template.is_set)
+        {
             attr.id = SAI_PORT_ATTR_PATH_TRACING_TIMESTAMP_TYPE;
             attr.value.u16 = cit.pt_timestamp_template.value;
             attrList.push_back(attr);
@@ -1502,6 +1502,16 @@ bool PortsOrch::addPortBulk(const std::vector<PortConfig> &portList, std::vector
         attrDataList.push_back(attrList);
         attrCountList.push_back(static_cast<std::uint32_t>(attrDataList.back().size()));
         attrPtrList.push_back(attrDataList.back().data());
+    }
+
+    // SAI reads exactly portCount entries from each array
+    if (attrCountList.size() != portCount || attrPtrList.size() != portCount)
+    {
+        SWSS_LOG_ERROR(
+            "Failed to create ports with bulk operation: %zu attribute entries for %u ports",
+            attrPtrList.size(), portCount
+        );
+        return false;
     }
 
     auto status = sai_port_api->create_ports(
