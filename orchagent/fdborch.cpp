@@ -19,6 +19,7 @@
 #include "directory.h"
 #include "timer.h"
 #include "neighorch.h"
+#include "swssnet.h"
 
 #define VLAN_PREFIX         "Vlan"
 
@@ -33,6 +34,30 @@ extern L2NhgOrch*       gL2NhgOrch;
 extern FdbOrch*         gFdbOrch;
 
 const int FdbOrch::fdborch_pri = 20;
+
+/* Adds the remote VTEP of a tunnel FDB entry to its SAI attributes */
+static void addEndpointIpAttr(const FdbData &fdbData, vector<sai_attribute_t> &attrs)
+{
+    if (fdbData.origin != FDB_ORIGIN_VXLAN_ADVERTIZED || fdbData.dest_type != FdbDest::VTEP)
+    {
+        return;
+    }
+
+    IpAddress remote = IpAddress(fdbData.dest_value);
+    sai_attribute_t attr;
+    attr.id = SAI_FDB_ENTRY_ATTR_ENDPOINT_IP;
+    copy(attr.value.ipaddr, remote);
+    attrs.push_back(attr);
+}
+
+/* Adds the forwarding action of an FDB entry to its SAI attributes */
+static void addPacketActionAttr(const FdbData &fdbData, vector<sai_attribute_t> &attrs)
+{
+    sai_attribute_t attr;
+    attr.id = SAI_FDB_ENTRY_ATTR_PACKET_ACTION;
+    attr.value.s32 = (fdbData.discard == "true") ? SAI_PACKET_ACTION_DROP : SAI_PACKET_ACTION_FORWARD;
+    attrs.push_back(attr);
+}
 
 FdbOrch::FdbOrch(DBConnector* applDbConnector, vector<table_name_with_pri_t> appFdbTables,
     TableConnector stateDbFdbConnector, TableConnector stateDbMclagFdbConnector, PortsOrch *port,
@@ -655,6 +680,7 @@ void FdbOrch::update(sai_fdb_event_t        type,
                 fdbData.dest_value = existing_entry->second.dest_value;
                 fdbData.esi = existing_entry->second.esi;
                 fdbData.vni = existing_entry->second.vni;
+                fdbData.discard = existing_entry->second.discard;
                 saved_fdb_entries[update.port.m_alias].push_back(
                         {existing_entry->first.mac, vlan.m_vlan_info.vlan_id, fdbData});
             }
@@ -669,9 +695,13 @@ void FdbOrch::update(sai_fdb_event_t        type,
                 attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
                 attr.value.s32 = SAI_FDB_ENTRY_TYPE_STATIC;
                 attrs.push_back(attr);
+                /* The entry goes back as stored: a stale event carries the bridge port of
+                   an entry replaced since, and sairedis forgets the key on any AGED event. */
                 attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
-                attr.value.oid = bridge_port_id;
+                attr.value.oid = existing_entry->second.bridge_port_id;
                 attrs.push_back(attr);
+                addEndpointIpAttr(existing_entry->second, attrs);
+                addPacketActionAttr(existing_entry->second, attrs);
                 auto status = sai_fdb_api->create_fdb_entry(entry, (uint32_t)attrs.size(), attrs.data());
                 if (status != SAI_STATUS_SUCCESS)
                 {
@@ -712,6 +742,8 @@ void FdbOrch::update(sai_fdb_event_t        type,
             attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
             attr.value.oid = existing_entry->second.bridge_port_id;
             attrs.push_back(attr);
+            addEndpointIpAttr(existing_entry->second, attrs);
+            addPacketActionAttr(existing_entry->second, attrs);
 
             SWSS_LOG_NOTICE("fdbEvent: MAC age event received, MAC is %s, added back"
                 "to HW type %s FDB %s in %s on %s",
@@ -756,9 +788,14 @@ void FdbOrch::update(sai_fdb_event_t        type,
                 attr.id = SAI_FDB_ENTRY_ATTR_TYPE;
                 attr.value.s32 = SAI_FDB_ENTRY_TYPE_STATIC;
                 attrs.push_back(attr);
-                attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
-                attr.value.oid = bridge_port_id;
+                attr.id = SAI_FDB_ENTRY_ATTR_ALLOW_MAC_MOVE;
+                attr.value.booldata = true;
                 attrs.push_back(attr);
+                m_entries[update.entry].allow_mac_move = true;
+                attr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+                attr.value.oid = existing_entry->second.bridge_port_id;
+                attrs.push_back(attr);
+                addPacketActionAttr(existing_entry->second, attrs);
                 auto status = sai_fdb_api->create_fdb_entry(entry, (uint32_t)attrs.size(), attrs.data());
                 if (status != SAI_STATUS_SUCCESS)
                 {
@@ -2143,7 +2180,8 @@ bool FdbOrch::addFdbEntry(const FdbEntry& entry, const string& port_name,
         {
             attr.id = SAI_FDB_ENTRY_ATTR_ALLOW_MAC_MOVE;
             attr.value.booldata = false;
-            attrs.push_back(attr);
+            /* Valid only on a static entry: on a set, it goes before the type turns dynamic */
+            attrs.insert((fdbData.sai_fdb_type == SAI_FDB_ENTRY_TYPE_DYNAMIC) ? attrs.begin() : attrs.end(), attr);
         }
     }
     attr.id = SAI_FDB_ENTRY_ATTR_PACKET_ACTION;
