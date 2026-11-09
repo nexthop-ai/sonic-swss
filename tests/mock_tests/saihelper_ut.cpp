@@ -3,10 +3,18 @@
 #include "mock_table.h"
 #include "mock_sai_capability_wrap.h"
 
+<<<<<<< HEAD
 #include <cstdint>
 #include <memory>
 #include <sstream>
 #include <vector>
+=======
+#include <atomic>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <thread>
+>>>>>>> f10e234d (NOS-20131: [orchagent] Restate a latched SAI failure at NOTICE once per 10 min, not at ERROR every second (#1822))
 
 extern std::unique_ptr<swss::DBConnector> gHealthStateDb;
 extern std::unique_ptr<swss::Table> gOrchHealthTable;
@@ -204,6 +212,7 @@ namespace sai_failure_status_test
         initSaiFailureTable();
     }
 
+<<<<<<< HEAD
     /*
      * querySupportedAclTableGroupType() must preserve the historical PARALLEL
      * default on every outcome except a *successful* enum-values query that
@@ -311,5 +320,191 @@ namespace sai_failure_status_test
             makeAclGroupTypeOverride(SAI_STATUS_FAILURE, {}));
         EXPECT_EQ(SAI_ACL_TABLE_GROUP_TYPE_PARALLEL,
                   querySupportedAclTableGroupType(SAI_NULL_OBJECT_ID));
+=======
+    static std::map<std::string, std::string> healthRow()
+    {
+        swss::DBConnector db("STATE_DB", 0);
+        swss::Table tbl(&db, "PROCESS_HEALTH");
+        std::vector<swss::FieldValueTuple> fvs;
+        std::map<std::string, std::string> row;
+        if (tbl.get("orchagent", fvs))
+        {
+            for (const auto& fv : fvs)
+            {
+                row[fvField(fv)] = fvValue(fv);
+            }
+        }
+        return row;
+    }
+
+    static void clearHealthRowExternally()
+    {
+        swss::DBConnector db("STATE_DB", 0);
+        swss::Table tbl(&db, "PROCESS_HEALTH");
+        std::vector<swss::FieldValueTuple> fvs;
+        fvs.emplace_back("unhealthy", "false");
+        fvs.emplace_back("error", "");
+        tbl.set("orchagent", fvs);
+    }
+
+    /*
+     * The row records when the current unhealthy episode started and how many
+     * failures have hit it, so a reader can tell a historical latch from a
+     * live stream of failures without counting syslog lines.
+     */
+    TEST_F(SaiFailureStatusTest, LatchRecordsEpisodeStartAndCount)
+    {
+        setSaiFailureStatus(false);
+        auto row = healthRow();
+        EXPECT_EQ(row["unhealthy"], "false");
+        EXPECT_EQ(row["count"], "0");
+        EXPECT_EQ(row["since"], "");
+
+        setSaiFailureStatus(true, "first error");
+        row = healthRow();
+        EXPECT_EQ(row["unhealthy"], "true");
+        EXPECT_EQ(row["count"], "1");
+        EXPECT_FALSE(row["since"].empty());
+        const std::string since = row["since"];
+
+        // A further failure while already unhealthy is counted against the same
+        // episode and reports the latest error, not a new start time.
+        setSaiFailureStatus(true, "second error");
+        row = healthRow();
+        EXPECT_EQ(row["count"], "2");
+        EXPECT_EQ(row["since"], since);
+        EXPECT_EQ(row["error"], "second error");
+
+        setSaiFailureStatus(false);
+        row = healthRow();
+        EXPECT_EQ(row["unhealthy"], "false");
+        EXPECT_EQ(row["count"], "0");
+        EXPECT_EQ(row["since"], "");
+    }
+
+    TEST_F(SaiFailureStatusTest, ReminderSilentWhileHealthy)
+    {
+        setSaiFailureStatus(false);
+        const auto now = std::chrono::steady_clock::now();
+        EXPECT_FALSE(logSaiFailureReminder(now));
+        EXPECT_FALSE(logSaiFailureReminder(now + SAI_FAILURE_REMINDER_INTERVAL));
+    }
+
+    /*
+     * The reminder cadence. OrchDaemon::start() calls this once per select
+     * timeout; a latched failure must be restated on the first pass and then
+     * once per interval, never once per pass.
+     */
+    TEST_F(SaiFailureStatusTest, ReminderRestatesOncePerInterval)
+    {
+        setSaiFailureStatus(false);
+        setSaiFailureStatus(true, "SAI failure");
+        const auto t0 = std::chrono::steady_clock::now();
+
+        EXPECT_TRUE(logSaiFailureReminder(t0));
+
+        // One-second select passes for the rest of the interval stay silent.
+        for (auto t = t0 + std::chrono::seconds(1);
+             t < t0 + SAI_FAILURE_REMINDER_INTERVAL;
+             t += std::chrono::seconds(1))
+        {
+            ASSERT_FALSE(logSaiFailureReminder(t));
+        }
+
+        // Once the interval has elapsed it is restated exactly once more.
+        EXPECT_TRUE(logSaiFailureReminder(t0 + SAI_FAILURE_REMINDER_INTERVAL));
+        EXPECT_FALSE(logSaiFailureReminder(t0 + SAI_FAILURE_REMINDER_INTERVAL + std::chrono::seconds(1)));
+
+        setSaiFailureStatus(false);
+    }
+
+    /*
+     * An operator reset through STATE_DB ends the episode: the reminder goes
+     * quiet, and a fresh failure afterwards is restated immediately with a new
+     * count rather than waiting out the previous interval.
+     */
+    TEST_F(SaiFailureStatusTest, ReminderFollowsExternalReset)
+    {
+        setSaiFailureStatus(false);
+        setSaiFailureStatus(true, "SAI failure");
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_TRUE(logSaiFailureReminder(t0));
+
+        clearHealthRowExternally();
+        EXPECT_FALSE(logSaiFailureReminder(t0 + std::chrono::seconds(1)));
+        // Detecting the reset normalises the row the operator only half-cleared.
+        auto row = healthRow();
+        EXPECT_EQ(row["unhealthy"], "false");
+        EXPECT_EQ(row["error"], "");
+        EXPECT_EQ(row["since"], "");
+        EXPECT_EQ(row["count"], "0");
+
+        setSaiFailureStatus(true, "later SAI failure");
+        EXPECT_TRUE(logSaiFailureReminder(t0 + std::chrono::seconds(2)));
+        row = healthRow();
+        EXPECT_EQ(row["count"], "1");
+        EXPECT_EQ(row["error"], "later SAI failure");
+
+        setSaiFailureStatus(false);
+    }
+
+    /*
+     * Ring mode splits the callers across threads: handleSaiFailure() latches
+     * from the ring thread while OrchDaemon::start() reads, restates and
+     * normalises from the main thread. Each round clears the row the way an
+     * operator would, then lets one latch from another thread overlap the
+     * main thread's read-decide-write. Whichever order they land in, the
+     * latch must still be in the row afterwards; an unserialised normalise
+     * would wipe it when the latch falls between the read and the write.
+     * The operator write itself runs while the latcher is idle, because the
+     * mock table is not thread-safe and the real one is a Redis server.
+     */
+    TEST_F(SaiFailureStatusTest, LatchFromAnotherThreadSurvivesOperatorReset)
+    {
+        setSaiFailureStatus(false);
+        std::atomic<int> rounds{0};
+        std::atomic<int> latched{0};
+        std::atomic<bool> stop{false};
+        std::thread latcher([&]() {
+            while (!stop.load())
+            {
+                if (latched.load() == rounds.load())
+                {
+                    std::this_thread::yield();
+                    continue;
+                }
+                setSaiFailureStatus(true, "ring thread failure");
+                latched++;
+            }
+        });
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 1000; i++)
+        {
+            clearHealthRowExternally();
+            rounds++;
+            std::string error;
+            if (i % 2 == 0)
+            {
+                getSaiFailureStatus(error);
+            }
+            else
+            {
+                logSaiFailureReminder(t0 + std::chrono::seconds(i));
+            }
+            while (latched.load() < rounds.load())
+            {
+                std::this_thread::yield();
+            }
+            auto row = healthRow();
+            ASSERT_EQ(row["unhealthy"], "true") << "latch lost in round " << i;
+            ASSERT_EQ(row["error"], "ring thread failure");
+            ASSERT_NE(row["count"], "0");
+            ASSERT_TRUE(getSaiFailureStatus(error));
+        }
+        stop = true;
+        latcher.join();
+        setSaiFailureStatus(false);
+>>>>>>> f10e234d (NOS-20131: [orchagent] Restate a latched SAI failure at NOTICE once per 10 min, not at ERROR every second (#1822))
     }
 }

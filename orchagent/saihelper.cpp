@@ -10,6 +10,7 @@ extern "C" {
 #include <string.h>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <logger.h>
 #include <sairedis.h>
 #include <set>
@@ -119,6 +120,18 @@ unique_ptr<DBConnector> gHealthStateDb;
 unique_ptr<Table> gOrchHealthTable;
 bool gOrchUnhealthyCached = false;
 std::string gLastSaiError;
+/* One "unhealthy episode" runs from the failure that set the latch until it is
+ * cleared: when it started, how many failures hit it, and whether/when the
+ * periodic reminder last restated it. */
+std::string gSaiFailureSince;
+uint32_t gSaiFailureCount = 0;
+static bool gSaiFailureReminded = false;
+static std::chrono::steady_clock::time_point gSaiFailureReminderLast;
+/* Guards every field above and the STATE_DB row. In ring mode handleSaiFailure()
+ * latches from the ring thread while OrchDaemon::start() reads, restates and
+ * normalises from the main thread; holding this across a read-decide-write
+ * keeps a failure that lands during an operator reset from being wiped. */
+static std::mutex gSaiFailureMutex;
 
 vector<sai_object_id_t> gGearboxOids;
 
@@ -1193,13 +1206,35 @@ void initSaiFailureTable()
     gOrchHealthTable = make_unique<Table>(gHealthStateDb.get(), STATE_PROCESS_HEALTH_TABLE_NAME);
 }
 
-void setSaiFailureStatus(bool unhealthy, const std::string& error)
+static void resetSaiFailureEpisode()
 {
-    gOrchUnhealthyCached = unhealthy;
-    if (unhealthy && !error.empty())
+    gSaiFailureSince.clear();
+    gSaiFailureCount = 0;
+    gSaiFailureReminded = false;
+}
+
+/* Caller holds gSaiFailureMutex. */
+static void setSaiFailureStatusLocked(bool unhealthy, const std::string& error)
+{
+    if (unhealthy)
     {
-        gLastSaiError = error;
+        if (!gOrchUnhealthyCached)
+        {
+            /* Healthy -> unhealthy: a new episode starts with this failure. */
+            gSaiFailureSince = getTimestamp();
+            gSaiFailureCount = 0;
+        }
+        gSaiFailureCount++;
+        if (!error.empty())
+        {
+            gLastSaiError = error;
+        }
     }
+    else
+    {
+        resetSaiFailureEpisode();
+    }
+    gOrchUnhealthyCached = unhealthy;
     if (!gOrchHealthTable)
     {
         return;
@@ -1209,6 +1244,8 @@ void setSaiFailureStatus(bool unhealthy, const std::string& error)
         vector<FieldValueTuple> fvs;
         fvs.emplace_back("unhealthy", unhealthy ? "true" : "false");
         fvs.emplace_back("error", error);
+        fvs.emplace_back("since", gSaiFailureSince);
+        fvs.emplace_back("count", to_string(gSaiFailureCount));
         gOrchHealthTable->set(PROCESS_HEALTH_KEY, fvs);
     }
     catch (const std::exception& e)
@@ -1217,7 +1254,14 @@ void setSaiFailureStatus(bool unhealthy, const std::string& error)
     }
 }
 
-bool getSaiFailureStatus(std::string& error)
+void setSaiFailureStatus(bool unhealthy, const std::string& error)
+{
+    std::lock_guard<std::mutex> lock(gSaiFailureMutex);
+    setSaiFailureStatusLocked(unhealthy, error);
+}
+
+/* Caller holds gSaiFailureMutex. */
+static bool getSaiFailureStatusLocked(std::string& error)
 {
     /* Fast path: when the local cache says healthy, skip Redis entirely.
      * Only read STATE_DB when unhealthy, so an external reset
@@ -1260,14 +1304,19 @@ bool getSaiFailureStatus(std::string& error)
     }
     if (!unhealthy)
     {
-        /* External reset detected — update local cache */
-        gOrchUnhealthyCached = false;
+        /* External reset detected: end the episode and normalise the row, so
+         * an operator who only flipped "unhealthy" does not leave a stale
+         * error, start time and count behind. The mutex is held from the
+         * read above through this write, so a failure latched meanwhile by
+         * another thread is serialised after it and not lost. */
+        setSaiFailureStatusLocked(false, "");
         error = "";
         return false;
     }
     return true;
 }
 
+<<<<<<< HEAD
 /*
  * Determine the ACL table group lookup type the platform actually supports.
  *
@@ -1354,5 +1403,46 @@ sai_acl_table_group_type_t querySupportedAclTableGroupType(sai_object_id_t switc
                       "default", status);
     }
     return SAI_ACL_TABLE_GROUP_TYPE_PARALLEL;
+=======
+bool getSaiFailureStatus(std::string& error)
+{
+    std::lock_guard<std::mutex> lock(gSaiFailureMutex);
+    return getSaiFailureStatusLocked(error);
+}
+
+bool logSaiFailureReminder(std::chrono::steady_clock::time_point now)
+{
+    std::string error;
+    std::string since;
+    uint32_t count;
+    {
+        std::lock_guard<std::mutex> lock(gSaiFailureMutex);
+        if (!getSaiFailureStatusLocked(error))
+        {
+            return false;
+        }
+        if (gSaiFailureReminded && now - gSaiFailureReminderLast < SAI_FAILURE_REMINDER_INTERVAL)
+        {
+            return false;
+        }
+        gSaiFailureReminded = true;
+        gSaiFailureReminderLast = now;
+        since = gSaiFailureSince;
+        count = gSaiFailureCount;
+    }
+    /*
+     * NOTICE, not ERROR: the failure was already reported at ERROR by
+     * handleSaiFailure() at the call site, and nothing clears the latch short
+     * of an orchagent restart or an operator reset. Repeating it at ERROR
+     * would keep every syslog-scanning consumer tripping on a historical
+     * event for the rest of the boot and bury the line that named it.
+     */
+    SWSS_LOG_NOTICE("Still unhealthy from an earlier SAI failure: %s "
+                    "(%u failure%s since %s). This restates a failure already logged "
+                    "at ERROR, not a new one; clear with: "
+                    "sonic-db-cli STATE_DB HSET \"PROCESS_HEALTH|orchagent\" unhealthy false",
+                    error.c_str(), count, count == 1 ? "" : "s", since.c_str());
+    return true;
+>>>>>>> f10e234d (NOS-20131: [orchagent] Restate a latched SAI failure at NOTICE once per 10 min, not at ERROR every second (#1822))
 }
 

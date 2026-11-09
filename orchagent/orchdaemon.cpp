@@ -1140,14 +1140,12 @@ void OrchDaemon::start(long heartBeatInterval)
 
             { TaskTimer t(m_taskStats["flush"]); flush(); }
             /*
-             * Log an error message periodically if a previous SAI API call failed with
-             * an unrecoverable error.
+             * Restate a latched SAI failure now and then. It was logged at
+             * ERROR where it happened and STATE_DB carries the status, so
+             * repeating it at ERROR on every pass only buries that line and
+             * floods syslog until orchagent restarts. Rate limited inside.
              */
-            string orchHealthError;
-            if (getSaiFailureStatus(orchHealthError))
-            {
-                SWSS_LOG_ERROR("%s", orchHealthError.c_str());
-            }
+            logSaiFailureReminder();
 
             flush();
         }

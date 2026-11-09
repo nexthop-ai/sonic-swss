@@ -2,6 +2,7 @@
 
 #include "gearboxutils.h"
 
+#include <chrono>
 #include <iosfwd>
 #include <string>
 
@@ -38,6 +39,35 @@ void initSaiFailureTable();
 void setSaiFailureStatus(bool unhealthy, const std::string& error = "");
 bool getSaiFailureStatus(std::string& error);
 
+<<<<<<< HEAD
+=======
+/* How often a latched SAI failure is restated while it stays set. */
+constexpr std::chrono::milliseconds SAI_FAILURE_REMINDER_INTERVAL = std::chrono::minutes(10);
+
+/* Restate a latched SAI failure at NOTICE, at most once per
+ * SAI_FAILURE_REMINDER_INTERVAL, so the standing condition stays visible in
+ * syslog without turning one failure into an unbounded ERROR stream. The
+ * failure itself is logged at ERROR where it happens, and STATE_DB
+ * PROCESS_HEALTH|orchagent carries the authoritative status. Returns true
+ * when a line was logged. The clock is injectable so tests can drive the
+ * cadence without sleeping. */
+bool logSaiFailureReminder(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+
+/* Fixed bounded retry around create_switch so a transient "syncd not ready yet"
+ * failure during a ZTP config reload does not immediately abort orchagent. The
+ * defaults (36 attempts, 5s apart = 180s) are sized to cover a single
+ * uninterrupted syncd SAI init. The parameters are defaulted so production
+ * always uses the fixed policy while tests can inject a smaller budget. */
+constexpr uint32_t SWITCH_CREATE_MAX_ATTEMPTS = 36;
+constexpr uint32_t SWITCH_CREATE_RETRY_INTERVAL_SEC = 5;
+
+sai_status_t createSwitchWithRetry(sai_object_id_t *switch_id,
+                                   uint32_t attr_count,
+                                   const sai_attribute_t *attr_list,
+                                   uint32_t max_attempts = SWITCH_CREATE_MAX_ATTEMPTS,
+                                   uint32_t retry_interval_sec = SWITCH_CREATE_RETRY_INTERVAL_SEC);
+
+>>>>>>> f10e234d (NOS-20131: [orchagent] Restate a latched SAI failure at NOTICE once per 10 min, not at ERROR every second (#1822))
 void setFlexCounterGroupParameter(const std::string &group,
                                   const std::string &poll_interval,
                                   const std::string &stats_mode,
