@@ -6,6 +6,7 @@
 #include "aclorch.h"
 #include "crmorch.h"
 #include "copporch.h"
+#include "flexcounterorch.h"
 #include "sfloworch.h"
 #include "twamporch.h"
 #include "vnetorch.h"
@@ -89,9 +90,42 @@ struct Portal
             return obj.processCoppRule(processCoppRule);
         }
 
+        static TrapIdHostIfTableMap getTrapIdHostIfTableMap(CoppOrch &obj)
+        {
+            return obj.m_trapid_hostif_table_map;
+        }
+
+        static void seedTrapGroupHostIf(CoppOrch &obj, sai_object_id_t tg_oid, sai_object_id_t hostif_oid)
+        {
+            obj.m_trap_group_hostif_map[tg_oid] = hostif_oid;
+        }
+
+        static bool createGenetlinkHostIfTable(CoppOrch &obj, std::vector<sai_hostif_trap_type_t> trapIds)
+        {
+            return obj.createGenetlinkHostIfTable(trapIds);
+        }
+
+        static bool removeGenetlinkHostIfTable(CoppOrch &obj, std::vector<sai_hostif_trap_type_t> trapIds)
+        {
+            return obj.removeGenetlinkHostIfTable(trapIds);
+        }
+
+        static bool hasTrapCounter(CoppOrch &obj, sai_object_id_t trap_oid)
+        {
+            return obj.m_trap_obj_name_map.count(trap_oid) != 0;
+        }
+
         static const std::unordered_set<sai_hostif_trap_type_t>& getSupportedTrapIds(const CoppOrch &obj)
         {
             return obj.supported_trap_ids;
+        }
+    };
+
+    struct FlexCounterOrchInternal
+    {
+        static void setHostIfTrapCounterState(FlexCounterOrch &obj, bool enabled)
+        {
+            obj.m_hostif_trap_counter_enabled = enabled;
         }
     };
 

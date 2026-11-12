@@ -442,6 +442,8 @@ bool CoppOrch::createGenetlinkHostIfTable(vector<sai_hostif_trap_type_t> &trap_i
 {
     SWSS_LOG_ENTER();
 
+    bool retryable_failure = false;
+
     for (auto trap_id : trap_id_list)
     {
         auto host_tbl_entry = m_trapid_hostif_table_map.find(trap_id);
@@ -482,19 +484,25 @@ bool CoppOrch::createGenetlinkHostIfTable(vector<sai_hostif_trap_type_t> &trap_i
                     task_process_status handle_status = handleSaiCreateStatus(SAI_API_HOSTIF, status);
                     if (handle_status != task_success)
                     {
-                        return parseHandleSaiStatusFailure(handle_status);
+                        // One trap's failed entry must not keep the rest of the list from getting theirs.
+                        if (!parseHandleSaiStatusFailure(handle_status))
+                        {
+                            retryable_failure = true;
+                        }
+                        continue;
                     }
                 }
                 m_trapid_hostif_table_map[trap_id] = hostif_table_entry;
             }
         }
     }
-    return true;
+    return !retryable_failure;
 }
 
 bool CoppOrch::removeGenetlinkHostIfTable(vector<sai_hostif_trap_type_t> &trap_id_list)
 {
     sai_status_t sai_status;
+    bool retryable_failure = false;
 
     for (auto trap_id : trap_id_list)
     {
@@ -509,19 +517,26 @@ bool CoppOrch::removeGenetlinkHostIfTable(vector<sai_hostif_trap_type_t> &trap_i
                 task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
                 if (handle_status != task_success)
                 {
-                    return parseHandleSaiStatusFailure(handle_status);
+                    // One entry that fails to go must not keep the rest of the list in place.
+                    if (!parseHandleSaiStatusFailure(handle_status))
+                    {
+                        retryable_failure = true;
+                    }
+                    continue;
                 }
             }
             m_trapid_hostif_table_map.erase(trap_id);
         }
     }
-    return true;
+    return !retryable_failure;
 
 }
 bool CoppOrch::applyAttributesToTrapIds(sai_object_id_t trap_group_id,
                                         const vector<sai_hostif_trap_type_t> &trap_id_list,
                                         vector<sai_attribute_t> &trap_id_attribs)
 {
+    bool retryable_failure = false;
+
     for (auto trap_id : trap_id_list)
     {
         sai_attribute_t attr;
@@ -541,7 +556,12 @@ bool CoppOrch::applyAttributesToTrapIds(sai_object_id_t trap_group_id,
             task_process_status handle_status = handleSaiCreateStatus(SAI_API_HOSTIF, status);
             if (handle_status != task_success)
             {
-                return parseHandleSaiStatusFailure(handle_status);
+                // A trap the platform rejects must not keep the rest of the list from installing.
+                if (!parseHandleSaiStatusFailure(handle_status))
+                {
+                    retryable_failure = true;
+                }
+                continue;
             }
         }
 
@@ -551,7 +571,7 @@ bool CoppOrch::applyAttributesToTrapIds(sai_object_id_t trap_group_id,
         m_syncdTrapIds[trap_id].trap_type = trap_id;
         bindTrapCounter(hostif_trap_id, trap_id);
     }
-    return true;
+    return !retryable_failure;
 }
 
 bool CoppOrch::removePolicer(string trap_group_name)
@@ -826,8 +846,10 @@ task_process_status CoppOrch::processCoppRule(Consumer& consumer)
                 return task_process_status::task_failed;
             }
         }
+        bool entry_failed = false;
         if (!trap_id_attribs.empty())
         {
+            bool need_retry = false;
             vector<sai_hostif_trap_type_t> group_trap_ids;
             TrapIdAttribs trap_attr = m_trap_group_trap_id_attrs[trap_group_name];
             getTrapIdsFromTrapGroup(m_trap_group_map[trap_group_name],
@@ -846,10 +868,20 @@ task_process_status CoppOrch::processCoppRule(Consumer& consumer)
                         task_process_status handle_status = handleSaiSetStatus(SAI_API_HOSTIF, sai_status);
                         if (handle_status != task_process_status::task_success)
                         {
-                            return handle_status;
+                            // A trap that rejects an attribute must not keep the rest of the group from taking it.
+                            if (!parseHandleSaiStatusFailure(handle_status))
+                            {
+                                need_retry = true;
+                            }
+                            entry_failed = true;
                         }
                     }
                 }
+            }
+            // The retry re-runs this entry from the start, trap ID changes included.
+            if (need_retry)
+            {
+                return task_process_status::task_need_retry;
             }
             for (auto i: trap_id_attribs)
             {
@@ -872,9 +904,10 @@ task_process_status CoppOrch::processCoppRule(Consumer& consumer)
             {
                 return task_process_status::task_failed;
             }
+            // Traps that didn't get a table entry must not keep the rest of the entry from applying.
             if (!createGenetlinkHostIfTable(genetlink_trap_ids))
             {
-                return task_process_status::task_failed;
+                entry_failed = true;
             }
             if (gP4Orch &&
                 !gP4Orch->getAclRuleManager()->updateUserDefinedTrap(trap_group_name, /*is_delete=*/false).ok())
@@ -883,6 +916,10 @@ task_process_status CoppOrch::processCoppRule(Consumer& consumer)
             }
         }
         if (!trapGroupProcessTrapIdChange(trap_group_name, add_trap_ids, rem_trap_ids))
+        {
+            return task_process_status::task_failed;
+        }
+        if (entry_failed)
         {
             return task_process_status::task_failed;
         }
@@ -1074,6 +1111,8 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
                                           vector<sai_hostif_trap_type_t> &add_trap_ids,
                                           vector<sai_hostif_trap_type_t> &rem_trap_ids)
 {
+    // A failed addition must not keep the removals from running.
+    bool traps_added = true;
     if (!add_trap_ids.empty())
     {
         sai_attribute_t attr;
@@ -1083,15 +1122,21 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
 
         add_trap_attr.push_back(attr);
 
+        bool old_traps_removed = true;
+        vector<sai_hostif_trap_type_t> create_trap_ids;
         for(auto i: add_trap_ids)
         {
             if (m_syncdTrapIds.find(i)!= m_syncdTrapIds.end())
             {
                 if (!removeTrap(m_syncdTrapIds[i].trap_obj, i))
                 {
-                    return false;
+                    // A trap still installed in its old group can't be created in this one.
+                    old_traps_removed = false;
+                    continue;
                 }
+                m_syncdTrapIds.erase(i);
             }
+            create_trap_ids.push_back(i);
         }
 
         for (auto it: m_trap_group_trap_id_attrs[trap_group_name])
@@ -1100,23 +1145,31 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
             attr.value = it.second;
             add_trap_attr.push_back(attr);
         }
-        if (!applyAttributesToTrapIds(m_trap_group_map[trap_group_name], add_trap_ids,
-                                      add_trap_attr))
+        bool traps_applied = applyAttributesToTrapIds(m_trap_group_map[trap_group_name], create_trap_ids,
+                                                      add_trap_attr);
+        if (!traps_applied)
         {
             SWSS_LOG_ERROR("Failed to set traps to trap group %s", trap_group_name.c_str());
-            return false;
         }
         if (m_trap_group_hostif_map.find(m_trap_group_map[trap_group_name]) !=
                                          m_trap_group_hostif_map.end())
         {
-            if (!createGenetlinkHostIfTable(add_trap_ids))
+            // Table entries go to the traps that were installed, not to every trap requested.
+            vector<sai_hostif_trap_type_t> group_trap_ids;
+            getTrapIdsFromTrapGroup(m_trap_group_map[trap_group_name], group_trap_ids);
+            if (!createGenetlinkHostIfTable(group_trap_ids))
             {
-                return false;
+                traps_added = false;
             }
+        }
+        if (!traps_applied || !old_traps_removed)
+        {
+            traps_added = false;
         }
     }
     if (!rem_trap_ids.empty())
     {
+        bool traps_removed = true;
         for (auto i: rem_trap_ids)
         {
             if (m_syncdTrapIds.find(i)!= m_syncdTrapIds.end())
@@ -1134,18 +1187,19 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
                 {
                     if (!removeTrap(m_syncdTrapIds[i].trap_obj, i))
                     {
-                        return false;
+                        traps_removed = false;
+                        continue;
                     }
                     m_syncdTrapIds.erase(i);
                 }
             }
         }
-        if (!removeGenetlinkHostIfTable(rem_trap_ids))
+        if (!traps_removed)
         {
             return false;
         }
     }
-    return true;
+    return traps_added;
 }
 
 bool CoppOrch::processTrapGroupDel (string trap_group_name)
@@ -1171,21 +1225,29 @@ bool CoppOrch::processTrapGroupDel (string trap_group_name)
 
     /* Reset the trap IDs to default trap group with default attributes */
     vector<sai_hostif_trap_type_t> trap_ids_to_reset;
+    bool traps_removed = true;
     for (auto it : m_syncdTrapIds)
     {
         if (it.second.trap_group_obj == m_trap_group_map[trap_group_name])
         {
-            trap_ids_to_reset.push_back(it.first);
             if (!removeTrap(it.second.trap_obj, it.first))
             {
-                return false;
+                traps_removed = false;
+                continue;
             }
+            trap_ids_to_reset.push_back(it.first);
         }
     }
 
     for (auto it: trap_ids_to_reset)
     {
         m_syncdTrapIds.erase(it);
+    }
+
+    // The group can't be removed while a trap still uses it.
+    if (!traps_removed)
+    {
+        return false;
     }
 
     sai_status_t sai_status = sai_hostif_api->remove_hostif_trap_group(
@@ -1357,6 +1419,7 @@ bool CoppOrch::trapGroupUpdatePolicer (string trap_group_name,
 
     auto policer_object = getPolicer(trap_group_name);
     auto policer_id = policer_object.policer_id;
+    bool retryable_failure = false;
 
     if (SAI_NULL_OBJECT_ID == policer_id)
     {
@@ -1412,12 +1475,17 @@ bool CoppOrch::trapGroupUpdatePolicer (string trap_group_name,
                 task_process_status handle_status = handleSaiSetStatus(SAI_API_POLICER, sai_status);
                 if (handle_status != task_success)
                 {
-                    return parseHandleSaiStatusFailure(handle_status);
+                    // An attribute the policer rejects must not keep the rest from applying.
+                    if (!parseHandleSaiStatusFailure(handle_status))
+                    {
+                        retryable_failure = true;
+                    }
+                    continue;
                 }
             }
         }
     }
-    return true;
+    return !retryable_failure;
 }
 
 void CoppOrch::initTrapRatePlugin()
@@ -1449,6 +1517,15 @@ void CoppOrch::initTrapRatePlugin()
 
 bool CoppOrch::removeTrap(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t trap_type)
 {
+    // SAI refuses to remove a trap while a table entry still names it.
+    vector<sai_hostif_trap_type_t> table_trap_ids = { trap_type };
+    bool had_table_entry = m_trapid_hostif_table_map.find(trap_type) != m_trapid_hostif_table_map.end();
+    removeGenetlinkHostIfTable(table_trap_ids);
+    if (m_trapid_hostif_table_map.find(trap_type) != m_trapid_hostif_table_map.end())
+    {
+        return false;
+    }
+
     unbindTrapCounter(hostif_trap_id);
 
     sai_status_t sai_status = sai_hostif_api->remove_hostif_trap(hostif_trap_id);
@@ -1459,6 +1536,15 @@ bool CoppOrch::removeTrap(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t
         task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
         if (handle_status != task_success)
         {
+            if (handle_status == task_process_status::task_need_retry)
+            {
+                // The trap stays installed, so it keeps its counter and its table entry.
+                bindTrapCounter(hostif_trap_id, trap_type);
+                if (had_table_entry)
+                {
+                    createGenetlinkHostIfTable(table_trap_ids);
+                }
+            }
             return parseHandleSaiStatusFailure(handle_status);
         }
     }
