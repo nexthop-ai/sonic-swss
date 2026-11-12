@@ -299,6 +299,45 @@ namespace flexcounter_test
         sai_switch_api = pold_sai_switch_api;
     }
 
+    sai_buffer_api_t ut_sai_buffer_api;
+    sai_buffer_api_t *pold_sai_buffer_api;
+
+    // Model a vendor SAI that rejects XOFF_ROOM_WATERMARK_BYTES on an egress pool and fails
+    // the whole clear_buffer_pool_stats() call if the stat list contains it.
+    sai_status_t _ut_stub_sai_clear_buffer_pool_stats(
+        _In_ sai_object_id_t buffer_pool_id,
+        _In_ uint32_t number_of_counters,
+        _In_ const sai_stat_id_t *counter_ids)
+    {
+        sai_attribute_t attr;
+        attr.id = SAI_BUFFER_POOL_ATTR_TYPE;
+        if (pold_sai_buffer_api->get_buffer_pool_attribute(buffer_pool_id, 1, &attr) == SAI_STATUS_SUCCESS &&
+            attr.value.s32 == SAI_BUFFER_POOL_TYPE_EGRESS)
+        {
+            for (uint32_t i = 0; i < number_of_counters; i++)
+            {
+                if (counter_ids[i] == SAI_BUFFER_POOL_STAT_XOFF_ROOM_WATERMARK_BYTES)
+                {
+                    return SAI_STATUS_NOT_SUPPORTED;
+                }
+            }
+        }
+        return pold_sai_buffer_api->clear_buffer_pool_stats(buffer_pool_id, number_of_counters, counter_ids);
+    }
+
+    void _hook_sai_buffer_api()
+    {
+        ut_sai_buffer_api = *sai_buffer_api;
+        pold_sai_buffer_api = sai_buffer_api;
+        ut_sai_buffer_api.clear_buffer_pool_stats = _ut_stub_sai_clear_buffer_pool_stats;
+        sai_buffer_api = &ut_sai_buffer_api;
+    }
+
+    void _unhook_sai_buffer_api()
+    {
+        sai_buffer_api = pold_sai_buffer_api;
+    }
+
     enum class StartType
     {
         Cold,
@@ -350,6 +389,7 @@ namespace flexcounter_test
             }
 
             _hook_sai_switch_api();
+            _hook_sai_buffer_api();
 
             // Create dependencies ...
             TableConnector stateDbSwitchTable(m_state_db.get(), "SWITCH_CAPABILITY");
@@ -471,6 +511,7 @@ namespace flexcounter_test
             // clear orchs saved in directory
             gDirectory.m_values.clear();
 
+            _unhook_sai_buffer_api();
             _unhook_sai_switch_api();
         }
 
@@ -738,6 +779,21 @@ namespace flexcounter_test
         sai_object_id_t pool_oid;
         pool_oid = (*BufferOrch::m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME])["ingress_lossless_pool"].m_saiObjectId;
         ASSERT_TRUE(checkFlexCounter(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP, pool_oid, BUFFER_POOL_COUNTER_ID_LIST));
+        // The stubbed SAI rejects XOFF_ROOM on the egress pool: it is polled on the ingress
+        // pool only, and the group above is still set to READ_AND_CLEAR.
+        ASSERT_TRUE(checkFlexCounter(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP, pool_oid,
+                                     {
+                                         {BUFFER_POOL_COUNTER_ID_LIST,
+                                          "SAI_BUFFER_POOL_STAT_WATERMARK_BYTES,"
+                                          "SAI_BUFFER_POOL_STAT_XOFF_ROOM_WATERMARK_BYTES"}
+                                     }));
+        sai_object_id_t egress_pool_oid =
+            (*BufferOrch::m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME])["egress_lossless_pool"].m_saiObjectId;
+        ASSERT_TRUE(checkFlexCounter(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP, egress_pool_oid,
+                                     {
+                                         {BUFFER_POOL_COUNTER_ID_LIST,
+                                          "SAI_BUFFER_POOL_STAT_WATERMARK_BYTES"}
+                                     }));
         Port firstPort;
         gPortsOrch->getPort(firstPortName, firstPort);
         auto pgOid = firstPort.m_priority_group_ids[3];

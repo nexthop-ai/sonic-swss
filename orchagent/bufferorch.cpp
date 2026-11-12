@@ -296,34 +296,64 @@ void BufferOrch::generateBufferPoolWatermarkCounterIdList(void)
         return;
     }
 
-    // Detokenize the SAI watermark stats to a string, separated by comma
-    string statList;
-    for (const auto &it : bufferPoolWatermarkStatIds)
-    {
-        statList += (sai_serialize_buffer_pool_stat(it) + list_item_delimiter);
-    }
-    if (!statList.empty())
-    {
-        statList.pop_back();
-    }
-
     // Some platforms do not support buffer pool watermark clear operation on a particular pool
     // Invoke the SAI clear_stats API per pool to query the capability from the API call return status
     // We use bit mask to mark the clear watermark capability of each buffer pool. We use an unsigned int to place hold
     // these bits. This assumes the total number of buffer pools to be no greater than 32, which should satisfy all use cases.
+    //
+    // Each stat is probed on its own. A SAI may support WATERMARK_BYTES on a pool but not
+    // XOFF_ROOM_WATERMARK_BYTES (e.g. an egress or lossy pool with no headroom) and reject a
+    // multi-stat clear wholesale; probing both together would then mark the pool as unable to
+    // clear, so it is polled in READ mode and its watermark never resets. A pool polls only
+    // the stats that clear.
     unsigned int noWmClrCapability = 0;
     unsigned int bitMask = 1;
+    unordered_map<sai_object_id_t, string> perPoolStatList;
     for (const auto &it : *(m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME]))
     {
-        sai_status_t status = sai_buffer_api->clear_buffer_pool_stats(
-                it.second.m_saiObjectId,
-                static_cast<uint32_t>(bufferPoolWatermarkStatIds.size()),
-                reinterpret_cast<const sai_stat_id_t *>(bufferPoolWatermarkStatIds.data()));
-        if (status ==  SAI_STATUS_NOT_SUPPORTED || status == SAI_STATUS_NOT_IMPLEMENTED)
+        sai_object_id_t pool_oid = it.second.m_saiObjectId;
+        vector<sai_buffer_pool_stat_t> statIds;
+
+        for (const auto &stat : bufferPoolWatermarkStatIds)
         {
-            SWSS_LOG_NOTICE("Clear watermark failed on %s, rv: %s", it.first.c_str(), sai_serialize_status(status).c_str());
-            noWmClrCapability |= bitMask;
+            sai_status_t status = sai_buffer_api->clear_buffer_pool_stats(
+                    pool_oid, 1, reinterpret_cast<const sai_stat_id_t *>(&stat));
+
+            if (stat == SAI_BUFFER_POOL_STAT_WATERMARK_BYTES)
+            {
+                if (status == SAI_STATUS_NOT_SUPPORTED || status == SAI_STATUS_NOT_IMPLEMENTED)
+                {
+                    // The pool cannot clear its watermark, so the probe says nothing about the
+                    // other stats: poll the full list in READ mode, as before.
+                    SWSS_LOG_NOTICE("Clear watermark failed on %s, rv: %s", it.first.c_str(), sai_serialize_status(status).c_str());
+                    noWmClrCapability |= bitMask;
+                    statIds = bufferPoolWatermarkStatIds;
+                    break;
+                }
+                statIds.push_back(stat);
+            }
+            else if (status == SAI_STATUS_SUCCESS)
+            {
+                statIds.push_back(stat);
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("Not polling %s on %s, clear rv: %s",
+                                sai_serialize_buffer_pool_stat(stat).c_str(), it.first.c_str(),
+                                sai_serialize_status(status).c_str());
+            }
         }
+
+        string statList;
+        for (const auto &s : statIds)
+        {
+            statList += (sai_serialize_buffer_pool_stat(s) + list_item_delimiter);
+        }
+        if (!statList.empty())
+        {
+            statList.pop_back();
+        }
+        perPoolStatList[pool_oid] = statList;
 
         bitMask <<= 1;
     }
@@ -355,7 +385,7 @@ void BufferOrch::generateBufferPoolWatermarkCounterIdList(void)
             bitMask <<= 1;
         }
 
-        startFlexCounterPolling(gSwitchId, key, statList, BUFFER_POOL_COUNTER_ID_LIST, stats_mode);
+        startFlexCounterPolling(gSwitchId, key, perPoolStatList[it.second.m_saiObjectId], BUFFER_POOL_COUNTER_ID_LIST, stats_mode);
     }
 
     m_isBufferPoolWatermarkCounterIdListGenerated = true;
