@@ -21,26 +21,44 @@ StpOrch::StpOrch(DBConnector * db, DBConnector * stateDb, vector<string> &tableN
 
     sai_attribute_t attr;
     sai_status_t status;
-    bool ret = false;
+    bool ret;
 
     m_stpTable = unique_ptr<Table>(new Table(stateDb, STATE_STP_TABLE_NAME));
 
-    vector<sai_attribute_t> attrs;
-    attr.id = SAI_SWITCH_ATTR_DEFAULT_STP_INST_ID;
-    attrs.push_back(attr);
+    // Read one at a time: a SAI that cannot report the instance limit still
+    // has a default instance, and VLANs leaving STP go back to it.
+    ret = readDefaultStpId();
 
     attr.id = SAI_SWITCH_ATTR_MAX_STP_INSTANCE;
-    attrs.push_back(attr);
-    status = sai_switch_api->get_switch_attribute(gSwitchId, (uint32_t)attrs.size(), attrs.data());
+    status = sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr);
     if (status == SAI_STATUS_SUCCESS)
     {
-	    m_defaultStpId = attrs[0].value.oid;
-        updateMaxStpInstance(attrs[1].value.u32);
-        ret = true;
+        updateMaxStpInstance(attr.value.u32);
+    }
+    else
+    {
+        SWSS_LOG_WARN("Failed to get the maximum number of STP instances, status %d; using %d",
+                      status, STP_FALLBACK_MAX_INSTANCES);
+        m_maxStpInstance = STP_FALLBACK_MAX_INSTANCES;
+        publishMaxStpInstance();
     }
 
     SWSS_LOG_NOTICE("StpOrch initialization %s", (ret == true)?"success":"failure");
 };
+
+bool StpOrch::readDefaultStpId()
+{
+    sai_attribute_t attr;
+    attr.id = SAI_SWITCH_ATTR_DEFAULT_STP_INST_ID;
+    sai_status_t status = sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to get the default STP instance, status %d", status);
+        return false;
+    }
+    m_defaultStpId = attr.value.oid;
+    return true;
+}
 
 
 sai_object_id_t StpOrch::getStpInstanceOid(sai_uint16_t stp_instance)
@@ -172,6 +190,17 @@ bool StpOrch::removeVlanFromStpInstance(string vlan_alias, sai_uint16_t stp_inst
     if (!gPortsOrch->getPort(vlan_alias, vlan))
     {
         return false;
+    }
+
+    // Without the default instance the VLAN cannot leave its instance, and
+    // retrying would fail the same way, so the request is dropped. The VLAN's
+    // STP instance and its STP ports are left in place: the instance cannot be
+    // removed while the VLAN still uses it.
+    if (m_defaultStpId == SAI_NULL_OBJECT_ID && !readDefaultStpId())
+    {
+        SWSS_LOG_ERROR("No default STP instance, VLAN %s stays in STP instance:%d",
+                       vlan_alias.c_str(), vlan.m_stp_id);
+        return true;
     }
 
     attr.id = SAI_VLAN_ATTR_STP_INSTANCE;
@@ -600,16 +629,20 @@ void StpOrch::doTask(Consumer &consumer)
     }
 }
 
+void StpOrch::publishMaxStpInstance()
+{
+    vector<FieldValueTuple> tuples;
+    FieldValueTuple tuple("max_stp_inst", to_string(m_maxStpInstance));
+    tuples.push_back(tuple);
+    m_stpTable->set("GLOBAL", tuples);
+}
+
 bool StpOrch::updateMaxStpInstance(uint32_t max_stp_instances)
 {
     m_maxStpInstance = (sai_uint16_t)max_stp_instances - 1;
 
     SWSS_LOG_NOTICE("StpOrch Max STP instances %d", m_maxStpInstance);
-
-    vector<FieldValueTuple> tuples;
-    FieldValueTuple tuple("max_stp_inst", to_string(m_maxStpInstance));
-    tuples.push_back(tuple);
-    m_stpTable->set("GLOBAL", tuples);
+    publishMaxStpInstance();
 
     return true;
   
