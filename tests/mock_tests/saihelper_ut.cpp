@@ -5,8 +5,18 @@
 
 #include <cstdint>
 #include <memory>
+#include <initializer_list>
+#include <ostream>
 #include <sstream>
+#include <string>
 #include <vector>
+<<<<<<< HEAD
+=======
+#include <atomic>
+#include <map>
+#include <thread>
+#include <vector>
+>>>>>>> ff4e0da2 (NOS-23003: [orchagent] promote the Redis mode to ZMQ when context config pins zmq_enable (#1899))
 
 extern std::unique_ptr<swss::DBConnector> gHealthStateDb;
 extern std::unique_ptr<swss::Table> gOrchHealthTable;
@@ -15,64 +25,135 @@ extern std::string gLastSaiError;
 
 namespace saihelper_test
 {
-    TEST(ResolveCommunicationModeFromContextConfig, NonZmqInputUnchanged)
+    struct CommModeCase
     {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":0,"zmq_enable":false}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC));
+        const char *name;
+        std::string json;
+        sai_redis_communication_mode_t input;
+        sai_redis_communication_mode_t expected;
+        bool pinnedToZmq;
+    };
+
+    void PrintTo(const CommModeCase &c, std::ostream *os)
+    {
+        *os << c.name;
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, RedisSyncInputUnchanged)
+    class ResolveCommunicationModeTest : public ::testing::TestWithParam<CommModeCase>
     {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":0,"zmq_enable":false}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC));
+    };
+
+    TEST_P(ResolveCommunicationModeTest, Resolves)
+    {
+        const CommModeCase &c = GetParam();
+        std::istringstream iss(c.json);
+        const CommunicationModeResolution resolved =
+            resolveCommunicationModeFromContextConfig(iss, c.input);
+        EXPECT_EQ(c.expected, resolved.mode);
+        EXPECT_EQ(c.pinnedToZmq, resolved.pinnedToZmq);
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, ZmqDisabledForGuidZeroDemotes)
+    // Fields ContextConfigContainer::loadFromFile requires on every context.
+    // zmqLiteral is a JSON literal ("true", "false", "\"true\"", "1") or null
+    // to omit zmq_enable.
+    std::string validContext(unsigned guid, const char *zmqLiteral)
     {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":0,"zmq_enable":false}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
+        std::string id = std::to_string(guid);
+        std::string body = std::string("{\"guid\":") + id +
+            ",\"name\":\"syncd" + id +
+            "\",\"dbAsic\":\"ASIC_DB" + id +
+            "\",\"dbCounters\":\"COUNTERS_DB" + id +
+            "\",\"dbFlex\":\"FLEX_COUNTER_DB" + id +
+            "\",\"dbState\":\"STATE_DB\",\"switches\":[{\"index\":0,\"hwinfo\":\"\"}]";
+        if (zmqLiteral != nullptr)
+        {
+            body += std::string(",\"zmq_enable\":") + zmqLiteral;
+        }
+        body += "}";
+        return body;
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, ZmqEnabledForGuidZeroUnchanged)
+    std::string contextMissingDbAsic(unsigned guid)
     {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":0,"zmq_enable":true}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
+        std::string id = std::to_string(guid);
+        return std::string("{\"guid\":") + id +
+            ",\"name\":\"syncd" + id +
+            "\",\"dbCounters\":\"COUNTERS_DB" + id +
+            "\",\"dbFlex\":\"FLEX_COUNTER_DB" + id +
+            "\",\"dbState\":\"STATE_DB\",\"switches\":[{\"index\":0,\"hwinfo\":\"\"}],\"zmq_enable\":false}";
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, MissingZmqEnableUnchanged)
+    std::string contexts(std::initializer_list<std::string> items)
     {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":0}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
+        std::string body = "{\"CONTEXTS\":[";
+        const char *sep = "";
+        for (const auto &item : items)
+        {
+            body += sep;
+            body += item;
+            sep = ",";
+        }
+        body += "]}";
+        return body;
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, NonZeroGuidSkipped)
+    // guid 0's zmq_enable is applied only when every context would load in
+    // sairedis. A non-bool zmq_enable, or a sibling missing a required field,
+    // keeps the starting mode and does not pin, on the promote and demote paths.
+    std::vector<CommModeCase> makeCommModeCases()
     {
-        // Only guid=0 (the default context) is consulted; non-zero guids are
-        // ignored even if they disable zmq.
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":1,"zmq_enable":false}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
+        const auto redisAsync = SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC;
+        const auto redisSync = SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC;
+        const auto zmqSync = SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC;
+        return {
+            {"ZmqDisabledKeepsRedisAsync",
+             contexts({validContext(0, "false")}), redisAsync, redisAsync, false},
+            {"ZmqDisabledKeepsRedisSync",
+             contexts({validContext(0, "false")}), redisSync, redisSync, false},
+            {"ZmqDisabledDemotesZmqSync",
+             contexts({validContext(0, "false")}), zmqSync, redisSync, false},
+            {"ZmqEnabledKeepsZmqSync",
+             contexts({validContext(0, "true")}), zmqSync, zmqSync, true},
+            {"ZmqEnabledPromotesRedisSync",
+             contexts({validContext(0, "true")}), redisSync, zmqSync, true},
+            {"ZmqEnabledPromotesRedisAsync",
+             contexts({validContext(0, "true")}), redisAsync, zmqSync, true},
+            {"MissingZmqEnableKeepsZmqSync",
+             contexts({validContext(0, nullptr)}), zmqSync, zmqSync, false},
+            {"MissingZmqEnableKeepsRedisAsync",
+             contexts({validContext(0, nullptr)}), redisAsync, redisAsync, false},
+            {"MissingZmqEnableKeepsRedisSync",
+             contexts({validContext(0, nullptr)}), redisSync, redisSync, false},
+            {"NonZeroGuidIgnored",
+             contexts({validContext(1, "false")}), zmqSync, zmqSync, false},
+            {"NonZeroGuidPinIgnored",
+             contexts({validContext(1, "true")}), redisAsync, redisAsync, false},
+            {"GuidZeroDemotesAmongMultiple",
+             contexts({validContext(1, "true"), validContext(0, "false")}), zmqSync, redisSync, false},
+            {"GuidZeroFalseKeepsRedisAmongMultiple",
+             contexts({validContext(1, "true"), validContext(0, "false")}), redisAsync, redisAsync, false},
+            {"SiblingMissingDbAsicDoesNotPromote",
+             contexts({validContext(0, "true"), contextMissingDbAsic(1)}), redisAsync, redisAsync, false},
+            {"SiblingMissingDbAsicDoesNotDemote",
+             contexts({validContext(0, "false"), contextMissingDbAsic(1)}), zmqSync, zmqSync, false},
+            {"ZmqEnableStringKeepsRedis",
+             contexts({validContext(0, "\"true\"")}), redisAsync, redisAsync, false},
+            {"ZmqEnableNumberKeepsZmq",
+             contexts({validContext(0, "1")}), zmqSync, zmqSync, false},
+            {"MalformedJsonKeepsZmqSync",
+             "not valid json", zmqSync, zmqSync, false},
+            {"MalformedJsonKeepsRedisSync",
+             "not valid json", redisSync, redisSync, false},
+            {"MissingContextsKeyKeepsZmqSync",
+             R"({"OTHER_KEY":[]})", zmqSync, zmqSync, false},
+            {"MissingContextsKeyKeepsRedisAsync",
+             R"({"OTHER_KEY":[]})", redisAsync, redisAsync, false},
+        };
     }
 
-    TEST(ResolveCommunicationModeFromContextConfig, FindsGuidZeroAmongMultiple)
-    {
-        std::istringstream iss(R"({"CONTEXTS":[{"guid":1,"zmq_enable":true},{"guid":0,"zmq_enable":false}]})");
-        EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC,
-                  resolveCommunicationModeFromContextConfig(
-                      iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
-    }
+    const std::vector<CommModeCase> kCommModeCases = makeCommModeCases();
 
+<<<<<<< HEAD
     TEST(ResolveCommunicationModeFromContextConfig, MalformedJsonUnchanged)
     {
         std::istringstream iss("not valid json");
@@ -87,6 +168,44 @@ namespace saihelper_test
         EXPECT_EQ(SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC,
                   resolveCommunicationModeFromContextConfig(
                       iss, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC));
+=======
+    INSTANTIATE_TEST_SUITE_P(
+        ResolveCommunicationModeFromContextConfig,
+        ResolveCommunicationModeTest,
+        ::testing::ValuesIn(kCommModeCases),
+        [](const ::testing::TestParamInfo<CommModeCase> &info) -> std::string {
+            return info.param.name;
+        });
+
+    TEST(SortSystemPortConfigList, SameListForAnyKeyOrder)
+    {
+        // {port_id, switch_id, core_index, core_port_index, speed, num_voq}, in one CONFIG_DB key order
+        std::vector<sai_system_port_config_t> keyOrderA = {
+            {39, 0, 2, 25, 400000, 8},
+            {0, 0, 0, 0, 10000, 8},
+            {2, 0, 3, 5, 400000, 8},
+            {32, 0, 6, 5, 400000, 8},
+            {1, 0, 3, 1, 400000, 8},
+        };
+        std::vector<sai_system_port_config_t> keyOrderB(keyOrderA.rbegin(), keyOrderA.rend());
+        std::swap(keyOrderB[0], keyOrderB[2]);
+
+        sortSystemPortConfigList(keyOrderA);
+        sortSystemPortConfigList(keyOrderB);
+
+        ASSERT_EQ(keyOrderA.size(), keyOrderB.size());
+        for (size_t i = 0; i < keyOrderA.size(); i++)
+        {
+            EXPECT_EQ(keyOrderA[i].port_id, keyOrderB[i].port_id);
+            EXPECT_EQ(keyOrderA[i].attached_switch_id, keyOrderB[i].attached_switch_id);
+            EXPECT_EQ(keyOrderA[i].attached_core_index, keyOrderB[i].attached_core_index);
+            EXPECT_EQ(keyOrderA[i].attached_core_port_index, keyOrderB[i].attached_core_port_index);
+            EXPECT_EQ(keyOrderA[i].speed, keyOrderB[i].speed);
+            EXPECT_EQ(keyOrderA[i].num_voq, keyOrderB[i].num_voq);
+        }
+        EXPECT_EQ(0u, keyOrderA.front().port_id);
+        EXPECT_EQ(39u, keyOrderA.back().port_id);
+>>>>>>> ff4e0da2 (NOS-23003: [orchagent] promote the Redis mode to ZMQ when context config pins zmq_enable (#1899))
     }
 }
 

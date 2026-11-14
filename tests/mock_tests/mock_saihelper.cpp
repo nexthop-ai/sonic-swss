@@ -10,7 +10,15 @@
 #include "mock_response_publisher.h"
 #include "dash/dashresulthelper.h"
 #include "saihelper.h"
+#include <fstream>
+#include <map>
+#include <stdlib.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+extern bool gSyncMode;
+extern sai_redis_communication_mode_t gRedisCommunicationMode;
+extern std::map<std::string, std::string> gProfileMap;
 
 namespace saihelper_test
 {
@@ -27,6 +35,9 @@ namespace saihelper_test
     shared_ptr<swss::DBConnector> m_state_db;
 
     bool set_comm_mode_not_supported;
+    bool comm_mode_was_set;
+    int32_t comm_mode_set_value;
+    bool use_pipeline_was_set;
     bool use_pipeline_not_supported;
     bool record_output_dir_failure;
     bool record_filename_failure;
@@ -43,12 +54,15 @@ namespace saihelper_test
         switch (attr[0].id)
         {
             case SAI_REDIS_SWITCH_ATTR_REDIS_COMMUNICATION_MODE:
+                comm_mode_was_set = true;
+                comm_mode_set_value = attr[0].value.s32;
                 if (set_comm_mode_not_supported)
                 {
                     return SAI_STATUS_NOT_SUPPORTED;
                 }
                 break;
             case SAI_REDIS_SWITCH_ATTR_USE_PIPELINE:
+                use_pipeline_was_set = true;
                 if (use_pipeline_not_supported)
                 {
                     return SAI_STATUS_NOT_SUPPORTED;
@@ -133,6 +147,9 @@ namespace saihelper_test
                 m_state_db = make_shared<swss::DBConnector>("STATE_DB", 0);
 
                 set_comm_mode_not_supported = false;
+                comm_mode_was_set = false;
+                comm_mode_set_value = -1;
+                use_pipeline_was_set = false;
                 use_pipeline_not_supported = false;
                 record_output_dir_failure = false;
                 record_filename_failure = false;
@@ -288,6 +305,128 @@ namespace saihelper_test
         response_timeout_failure = false;
         (void) unsetenv("platform");
         _unhook_sai_apis();
+    }
+
+    // -s still rewrites a Redis mode and a plain -z zmq_sync when the context
+    // file did not pin ZMQ. A pin leaves ZMQ_SYNC alone, including the
+    // -s -z zmq_sync combination where the mode was already ZMQ. The
+    // deprecation warning is logged on every -s path, including that one.
+    TEST_F(SaihelperTest, SyncModeFlagDoesNotOverrideZmqPin)
+    {
+        _sai_syncd_notifications_count = (uint32_t*)mmap(NULL, sizeof(uint32_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_syncd_notification_event = (int32_t*)mmap(NULL, sizeof(int32_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(static_cast<void *>(_sai_syncd_notifications_count), MAP_FAILED);
+        ASSERT_NE(static_cast<void *>(_sai_syncd_notification_event), MAP_FAILED);
+        *_sai_syncd_notifications_count = 0;
+
+        _hook_sai_apis();
+
+        const bool savedSyncMode = gSyncMode;
+        const bool savedPinned = gContextConfigPinsZmq;
+        const sai_redis_communication_mode_t savedMode = gRedisCommunicationMode;
+
+        gSyncMode = true;
+
+        // File pin, mode already ZMQ_SYNC (-s -z zmq_sync): -s must not rewrite.
+        comm_mode_was_set = false;
+        use_pipeline_was_set = false;
+        gContextConfigPinsZmq = true;
+        gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC;
+        initSaiRedis();
+        EXPECT_EQ(gRedisCommunicationMode, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC);
+        EXPECT_TRUE(comm_mode_was_set);
+        EXPECT_EQ(comm_mode_set_value, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC);
+        EXPECT_FALSE(use_pipeline_was_set);
+
+        // No pin: -s still beats a command-line -z zmq_sync.
+        comm_mode_was_set = false;
+        gContextConfigPinsZmq = false;
+        gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC;
+        initSaiRedis();
+        EXPECT_EQ(gRedisCommunicationMode, SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC);
+        EXPECT_TRUE(comm_mode_was_set);
+        EXPECT_EQ(comm_mode_set_value, SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC);
+
+        comm_mode_was_set = false;
+        gContextConfigPinsZmq = false;
+        gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC;
+        initSaiRedis();
+        EXPECT_EQ(gRedisCommunicationMode, SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC);
+        EXPECT_TRUE(comm_mode_was_set);
+        EXPECT_EQ(comm_mode_set_value, SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC);
+
+        gSyncMode = savedSyncMode;
+        gContextConfigPinsZmq = savedPinned;
+        gRedisCommunicationMode = savedMode;
+        _unhook_sai_apis();
+        munmap(_sai_syncd_notifications_count, sizeof(uint32_t));
+        munmap(_sai_syncd_notification_event, sizeof(int32_t));
+        _sai_syncd_notifications_count = nullptr;
+        _sai_syncd_notification_event = nullptr;
+    }
+
+    // NOS-23003: swss_zmq is off, so orchagent starts in Redis, and -s is set.
+    // The context file pins guid 0 to ZMQ. The file read must promote the mode
+    // and set the pin, and initSaiRedis must send ZMQ_SYNC rather than let -s
+    // rewrite it.
+    TEST_F(SaihelperTest, ContextConfigPinSurvivesSyncMode)
+    {
+        _sai_syncd_notifications_count = (uint32_t*)mmap(NULL, sizeof(uint32_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_syncd_notification_event = (int32_t*)mmap(NULL, sizeof(int32_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(static_cast<void *>(_sai_syncd_notifications_count), MAP_FAILED);
+        ASSERT_NE(static_cast<void *>(_sai_syncd_notification_event), MAP_FAILED);
+        *_sai_syncd_notifications_count = 0;
+
+        char path[] = "/tmp/swss-context-config-XXXXXX";
+        int fd = mkstemp(path);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(close(fd), 0);
+        {
+            std::ofstream out(path);
+            out << R"({"CONTEXTS":[{"guid":0,"name":"syncd","dbAsic":"ASIC_DB","dbCounters":"COUNTERS_DB","dbFlex":"FLEX_COUNTER_DB","dbState":"STATE_DB","switches":[{"index":0,"hwinfo":""}],"zmq_enable":true}]})";
+            if (!out)
+            {
+                unlink(path);
+                FAIL() << "failed to write " << path;
+            }
+        }
+
+        _hook_sai_apis();
+
+        const bool savedSyncMode = gSyncMode;
+        const bool savedPinned = gContextConfigPinsZmq;
+        const sai_redis_communication_mode_t savedMode = gRedisCommunicationMode;
+
+        gSyncMode = true;
+        gContextConfigPinsZmq = false;
+        gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC;
+        comm_mode_was_set = false;
+        use_pipeline_was_set = false;
+
+        applyContextConfigCommunicationMode(path);
+        gProfileMap.erase(SAI_REDIS_KEY_CONTEXT_CONFIG);
+        EXPECT_TRUE(gContextConfigPinsZmq);
+        EXPECT_EQ(gRedisCommunicationMode, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC);
+
+        initSaiRedis();
+        EXPECT_EQ(gRedisCommunicationMode, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC);
+        EXPECT_TRUE(comm_mode_was_set);
+        EXPECT_EQ(comm_mode_set_value, SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC);
+        EXPECT_FALSE(use_pipeline_was_set);
+
+        gSyncMode = savedSyncMode;
+        gContextConfigPinsZmq = savedPinned;
+        gRedisCommunicationMode = savedMode;
+        _unhook_sai_apis();
+        munmap(_sai_syncd_notifications_count, sizeof(uint32_t));
+        munmap(_sai_syncd_notification_event, sizeof(int32_t));
+        _sai_syncd_notifications_count = nullptr;
+        _sai_syncd_notification_event = nullptr;
+        unlink(path);
     }
 
     TEST_F(SaihelperTest, TestCreateFailure) {

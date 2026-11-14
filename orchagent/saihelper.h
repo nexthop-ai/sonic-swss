@@ -21,10 +21,33 @@ void initSaiApi();
 void initSaiRedis();
 sai_status_t initSaiPhyApi(swss::gearbox_phy_t *phy);
 
-sai_redis_communication_mode_t resolveCommunicationModeFromContextConfig(
+// mode is the transport orchagent should use. pinnedToZmq is true when guid 0
+// sets zmq_enable: true, whether or not the mode had to change. sairedis locks
+// that context to ZMQ regardless of the command line.
+struct CommunicationModeResolution
+{
+    sai_redis_communication_mode_t mode;
+    bool pinnedToZmq;
+};
+
+CommunicationModeResolution resolveCommunicationModeFromContextConfig(
         std::istream& jsonStream,
         sai_redis_communication_mode_t currentMode);
 
+<<<<<<< HEAD
+=======
+// Read contextConfigPath when it exists and store guid 0's zmq_enable in
+// gRedisCommunicationMode and gContextConfigPinsZmq. A missing file clears the
+// pin and leaves the mode unchanged. initSaiApi() calls this with the hwsku path.
+void applyContextConfigCommunicationMode(const std::string &contextConfigPath);
+
+// Set by applyContextConfigCommunicationMode() from CommunicationModeResolution::pinnedToZmq.
+// initSaiRedis() leaves a pinned ZMQ mode in place when the deprecated -s flag is set.
+extern bool gContextConfigPinsZmq;
+
+void sortSystemPortConfigList(std::vector<sai_system_port_config_t> &sysportcfglist);
+
+>>>>>>> ff4e0da2 (NOS-23003: [orchagent] promote the Redis mode to ZMQ when context config pins zmq_enable (#1899))
 /* Handling SAI status*/
 task_process_status handleSaiCreateStatus(sai_api_t api, sai_status_t status, void *context = nullptr);
 task_process_status handleSaiSetStatus(sai_api_t api, sai_status_t status, void *context = nullptr);

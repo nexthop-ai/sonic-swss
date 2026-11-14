@@ -201,27 +201,68 @@ const sai_service_method_table_t test_services = {
     test_profile_get_next_value
 };
 
-// Resolve gRedisCommunicationMode against context_config.json. When -z zmq_sync
-// was requested but the JSON disables zmq for the default context (guid=0),
-// demote to REDIS_SYNC. Notification handlers in notifications.cpp gate
+// Same accesses as ContextConfigContainer::loadFromFile. Any throw there
+// discards the file and loads the default context, whose guid 0 follows the
+// command line. A missing required field or a non-bool zmq_enable on any
+// context, not only guid 0, is such a throw.
+static void requireSairedisContext(const nlohmann::json &item)
+{
+    (void)item.at("guid").get<uint32_t>();
+    (void)item.at("name").get<std::string>();
+    (void)item.at("dbAsic").get<std::string>();
+    (void)item.at("dbCounters").get<std::string>();
+    (void)item.at("dbFlex").get<std::string>();
+    (void)item.at("dbState").get<std::string>();
+
+    if (item.contains("zmq_enable"))
+    {
+        (void)item.at("zmq_enable").get<bool>();
+    }
+    if (item.contains("zmq_endpoint"))
+    {
+        (void)item.at("zmq_endpoint").get<std::string>();
+    }
+    if (item.contains("zmq_ntf_endpoint"))
+    {
+        (void)item.at("zmq_ntf_endpoint").get<std::string>();
+    }
+
+    for (const auto &sw : item.at("switches"))
+    {
+        (void)sw.at("index").get<uint32_t>();
+        (void)sw.at("hwinfo").get<std::string>();
+    }
+}
+
+// Resolve gRedisCommunicationMode against context_config.json for the default
+// context (guid=0). sairedis treats an explicit zmq_enable as authoritative:
+// true locks the channel to ZMQ at init, false makes it refuse ZMQ_SYNC. So an
+// explicit true promotes any mode to ZMQ_SYNC and an explicit false demotes
+// ZMQ_SYNC to REDIS_SYNC. Notification handlers in notifications.cpp gate
 // forwarding on this global, so it must reflect the actual transport sairedis
-// will use. Symmetric with the fallback in sairedis/syncd Syncd.cpp.
+// will use.
+//
+// Every context is checked with the same rules first. If any context would
+// make loadFromFile fall back to defaults, the starting mode is kept and
+// nothing is pinned, including a demotion that guid 0 would otherwise request.
 //
 // Takes an istream so it streams directly from the open file in production and
 // from std::istringstream in unit tests, with no intermediate copy.
-sai_redis_communication_mode_t resolveCommunicationModeFromContextConfig(
+CommunicationModeResolution resolveCommunicationModeFromContextConfig(
         std::istream& jsonStream,
         sai_redis_communication_mode_t currentMode)
 {
-    if (currentMode != SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC)
-    {
-        return currentMode;
-    }
+    CommunicationModeResolution resolved = { currentMode, false };
 
     try
     {
         nlohmann::json j;
         jsonStream >> j;
+
+        for (const auto &item : j.at("CONTEXTS"))
+        {
+            requireSairedisContext(item);
+        }
 
         for (auto& item : j["CONTEXTS"])
         {
@@ -231,39 +272,88 @@ sai_redis_communication_mode_t resolveCommunicationModeFromContextConfig(
                 continue;
             }
 
-            if (item.contains("zmq_enable") && item["zmq_enable"] == false)
+            if (!item.contains("zmq_enable"))
+            {
+                break;
+            }
+
+            if (item["zmq_enable"] == true)
+            {
+                if (currentMode != SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC)
+                {
+                    SWSS_LOG_NOTICE(
+                        "context %u: zmq_enable=true in context config pins sairedis "
+                        "to ZMQ, promoting gRedisCommunicationMode from %s to ZMQ_SYNC",
+                        guid, sai_serialize_redis_communication_mode(currentMode).c_str());
+                }
+                resolved.mode = SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC;
+                resolved.pinnedToZmq = true;
+                return resolved;
+            }
+
+            if (item["zmq_enable"] == false &&
+                currentMode == SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC)
             {
                 SWSS_LOG_NOTICE(
                     "context %u: zmq_enable=false in context config, demoting "
                     "gRedisCommunicationMode from ZMQ_SYNC to REDIS_SYNC",
                     guid);
-                return SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC;
+                resolved.mode = SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC;
+                return resolved;
             }
             break;
         }
     }
     catch (const std::exception& e)
     {
-        SWSS_LOG_WARN("Failed to parse context config for comm-mode resolution: %s",
+        SWSS_LOG_WARN("context config rejected (%s); sairedis falls back to defaults, "
+                      "leaving communication mode unchanged",
                       e.what());
     }
 
-    return currentMode;
+    return resolved;
 }
 
+<<<<<<< HEAD
+=======
+// CONFIG_DB key order changes when redis rehashes, and syncd compares this CREATE_ONLY
+// list in order on a warm restart, so it must come out the same on every start.
+void sortSystemPortConfigList(std::vector<sai_system_port_config_t> &sysportcfglist)
+{
+    std::sort(sysportcfglist.begin(), sysportcfglist.end(),
+              [](const sai_system_port_config_t &a, const sai_system_port_config_t &b)
+              {
+                  return a.port_id < b.port_id;
+              });
+}
+
+bool gContextConfigPinsZmq = false;
+
+void applyContextConfigCommunicationMode(const std::string &contextConfigPath)
+{
+    gContextConfigPinsZmq = false;
+
+    std::ifstream ifs(contextConfigPath);
+    if (!ifs.good())
+    {
+        return;
+    }
+
+    SWSS_LOG_NOTICE("Context config file %s exists", contextConfigPath.c_str());
+    gProfileMap[SAI_REDIS_KEY_CONTEXT_CONFIG] = contextConfigPath;
+
+    const CommunicationModeResolution resolved = resolveCommunicationModeFromContextConfig(
+        ifs, gRedisCommunicationMode);
+    gRedisCommunicationMode = resolved.mode;
+    gContextConfigPinsZmq = resolved.pinnedToZmq;
+}
+
+>>>>>>> ff4e0da2 (NOS-23003: [orchagent] promote the Redis mode to ZMQ when context config pins zmq_enable (#1899))
 void initSaiApi()
 {
     SWSS_LOG_ENTER();
 
-    std::ifstream ifs(CONTEXT_CFG_FILE);
-    if (ifs.good())
-    {
-        SWSS_LOG_NOTICE("Context config file %s exists", CONTEXT_CFG_FILE);
-        gProfileMap[SAI_REDIS_KEY_CONTEXT_CONFIG] = CONTEXT_CFG_FILE;
-
-        gRedisCommunicationMode = resolveCommunicationModeFromContextConfig(
-            ifs, gRedisCommunicationMode);
-    }
+    applyContextConfigCommunicationMode(CONTEXT_CFG_FILE);
 
     sai_api_initialize(0, (const sai_service_method_table_t *)&test_services);
 
@@ -398,11 +488,23 @@ void initSaiRedis()
     // SAI_REDIS_SWITCH_ATTR_SYNC_MODE attribute only setBuffer and g_syncMode to true
     // since it is not using ASIC_DB, we can execute it before create_switch
     // when g_syncMode is set to true here, create_switch will wait the response from syncd
+    // -s still forces REDIS_SYNC over a plain -z zmq_sync. A context_config
+    // zmq_enable: true pin is the exception, including when -z already selected
+    // ZMQ_SYNC: sairedis is locked to ZMQ, and rewriting the global would drop
+    // notifications. The warning still fires so an operator passing -s is told
+    // to drop it, and a NOTICE says the pin is why -s was ignored.
     if (gSyncMode)
     {
         SWSS_LOG_WARN("sync mode is depreacated, use -z param");
 
-        gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC;
+        if (!gContextConfigPinsZmq)
+        {
+            gRedisCommunicationMode = SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC;
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("-s ignored: context config pins guid 0 to ZMQ");
+        }
     }
 
     /**
