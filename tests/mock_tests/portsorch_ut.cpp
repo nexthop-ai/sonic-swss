@@ -752,6 +752,249 @@ namespace portsorch_test
         }
     }
 
+    // Fake PHY for the gearbox warm start tests: the ports that exist on it with their lanes, and what gets created
+    const sai_object_id_t _gb_phy_oid = 0x2100000000000000;
+    std::map<sai_object_id_t, std::vector<uint32_t>> _gb_existing_ports;
+    std::vector<std::vector<uint32_t>> _gb_created_port_lanes;
+    uint32_t _gb_create_port_connector_count;
+    uint32_t _gb_port_list_get_count;
+    bool _gb_port_list_get_fail;
+    bool _gb_lane_list_get_fail;
+    // State of the fake PHY's ports and serdes, and the sets and serdes removals that reach it
+    std::map<sai_object_id_t, sai_object_id_t> _gb_port_serdes;
+    swss::Table *_gb_asic_table;
+    std::vector<std::tuple<sai_object_id_t, sai_attr_id_t, int32_t>> _gb_sets;
+    uint32_t _gb_remove_port_serdes_count;
+
+    sai_status_t _ut_stub_gb_get_switch_attribute(
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t attr_count,
+        _Inout_ sai_attribute_t *attr_list)
+    {
+        if (switch_id != _gb_phy_oid || attr_count != 1)
+        {
+            return SAI_STATUS_NOT_SUPPORTED;
+        }
+        if (attr_list[0].id == SAI_SWITCH_ATTR_PORT_NUMBER)
+        {
+            attr_list[0].value.u32 = static_cast<uint32_t>(_gb_existing_ports.size());
+            return SAI_STATUS_SUCCESS;
+        }
+        if (attr_list[0].id == SAI_SWITCH_ATTR_PORT_LIST)
+        {
+            _gb_port_list_get_count++;
+            if (_gb_port_list_get_fail || attr_list[0].value.objlist.count < _gb_existing_ports.size())
+            {
+                return SAI_STATUS_FAILURE;
+            }
+            uint32_t i = 0;
+            for (const auto &it : _gb_existing_ports)
+            {
+                attr_list[0].value.objlist.list[i++] = it.first;
+            }
+            attr_list[0].value.objlist.count = i;
+            return SAI_STATUS_SUCCESS;
+        }
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+
+    sai_status_t _ut_stub_gb_get_port_attribute(
+        _In_ sai_object_id_t port_id,
+        _In_ uint32_t attr_count,
+        _Inout_ sai_attribute_t *attr_list)
+    {
+        if (attr_count == 1 && attr_list[0].id == SAI_PORT_ATTR_PORT_SERDES_ID)
+        {
+            auto serdes = _gb_port_serdes.find(port_id);
+            attr_list[0].value.oid = serdes != _gb_port_serdes.end() ? serdes->second : SAI_NULL_OBJECT_ID;
+            return SAI_STATUS_SUCCESS;
+        }
+        auto it = _gb_existing_ports.find(port_id);
+        if (attr_count == 1 && attr_list[0].id == SAI_PORT_ATTR_HW_LANE_LIST && it != _gb_existing_ports.end())
+        {
+            if (_gb_lane_list_get_fail)
+            {
+                return SAI_STATUS_FAILURE;
+            }
+            if (attr_list[0].value.u32list.count < it->second.size())
+            {
+                return SAI_STATUS_BUFFER_OVERFLOW;
+            }
+            std::copy(it->second.begin(), it->second.end(), attr_list[0].value.u32list.list);
+            attr_list[0].value.u32list.count = static_cast<uint32_t>(it->second.size());
+            return SAI_STATUS_SUCCESS;
+        }
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+
+    // As the gearbox syncd does, record an applied set in the Gearbox ASIC DB
+    sai_status_t _ut_stub_gb_set_port_attribute(
+        _In_ sai_object_id_t port_id,
+        _In_ const sai_attribute_t *attr)
+    {
+        if (attr->id == SAI_PORT_ATTR_ADMIN_STATE || attr->id == SAI_PORT_ATTR_FEC_MODE)
+        {
+            auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_PORT, attr->id);
+            _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT:" + sai_serialize_object_id(port_id), meta->attridname,
+                    sai_serialize_attr_value(*meta, *attr));
+            _gb_sets.emplace_back(port_id, attr->id,
+                    attr->id == SAI_PORT_ATTR_ADMIN_STATE ? attr->value.booldata : attr->value.s32);
+        }
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_status_t _ut_stub_gb_create_port_serdes(
+        _Out_ sai_object_id_t *port_serdes_id,
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+    {
+        sai_status_t status = _ut_stub_sai_create_port_serdes(port_serdes_id, switch_id, attr_count, attr_list);
+        for (uint32_t i = 0; status == SAI_STATUS_SUCCESS && i < attr_count; i++)
+        {
+            if (attr_list[i].id == SAI_PORT_SERDES_ATTR_PORT_ID)
+            {
+                _gb_port_serdes[attr_list[i].value.oid] = *port_serdes_id;
+            }
+        }
+        return status;
+    }
+
+    sai_status_t _ut_stub_gb_remove_port_serdes(
+        _In_ sai_object_id_t port_serdes_id)
+    {
+        _gb_remove_port_serdes_count++;
+        for (auto it = _gb_port_serdes.begin(); it != _gb_port_serdes.end(); it++)
+        {
+            if (it->second == port_serdes_id)
+            {
+                _gb_port_serdes.erase(it);
+                break;
+            }
+        }
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_status_t _ut_stub_gb_create_port(
+        _Out_ sai_object_id_t *port_id,
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+    {
+        for (uint32_t i = 0; i < attr_count; i++)
+        {
+            if (attr_list[i].id == SAI_PORT_ATTR_HW_LANE_LIST)
+            {
+                _gb_created_port_lanes.emplace_back(attr_list[i].value.u32list.list,
+                        attr_list[i].value.u32list.list + attr_list[i].value.u32list.count);
+            }
+        }
+        *port_id = _gb_phy_oid + 0x100 + _gb_created_port_lanes.size();
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_status_t _ut_stub_gb_create_port_connector(
+        _Out_ sai_object_id_t *port_connector_id,
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+    {
+        *port_connector_id = _gb_phy_oid + 0x200 + (++_gb_create_port_connector_count);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    void _hook_gb_sai_api()
+    {
+        _gb_existing_ports.clear();
+        _gb_created_port_lanes.clear();
+        _gb_create_port_connector_count = 0;
+        _gb_port_list_get_count = 0;
+        _gb_port_list_get_fail = false;
+        _gb_lane_list_get_fail = false;
+        _sai_create_port_serdes_calls.clear();
+        _gb_port_serdes.clear();
+        _gb_sets.clear();
+        _gb_remove_port_serdes_count = 0;
+
+        ut_sai_port_api = *sai_port_api;
+        pold_sai_port_api = sai_port_api;
+        ut_sai_port_api.get_port_attribute = _ut_stub_gb_get_port_attribute;
+        ut_sai_port_api.create_port = _ut_stub_gb_create_port;
+        ut_sai_port_api.create_port_connector = _ut_stub_gb_create_port_connector;
+        ut_sai_port_api.set_port_attribute = _ut_stub_gb_set_port_attribute;
+        ut_sai_port_api.remove_port_serdes = _ut_stub_gb_remove_port_serdes;
+        ut_sai_port_api.create_port_serdes = _ut_stub_gb_create_port_serdes;
+        sai_port_api = &ut_sai_port_api;
+
+        ut_sai_switch_api = *sai_switch_api;
+        pold_sai_switch_api = sai_switch_api;
+        ut_sai_switch_api.get_switch_attribute = _ut_stub_gb_get_switch_attribute;
+        sai_switch_api = &ut_sai_switch_api;
+    }
+
+    void _unhook_gb_sai_api()
+    {
+        sai_port_api = pold_sai_port_api;
+        sai_switch_api = pold_sai_switch_api;
+    }
+
+    // Hooks the fake PHY for a test body and puts the SAI APIs back when the body ends, however it ends
+    struct GbSaiApiHook
+    {
+        GbSaiApiHook() { _hook_gb_sai_api(); }
+        ~GbSaiApiHook() { _unhook_gb_sai_api(); }
+    };
+
+    // One gearbox interface on the fake PHY: system-side lanes 300,301 and line-side lanes 304,305, with tx taps
+    Port _setup_gb_interface(PortsOrch *orch)
+    {
+        Port p("Ethernet0", Port::PHY);
+        p.m_index = 1;
+        p.m_port_id = 0x1000000000001;
+
+        gearbox_phy_t phy = {};
+        phy.phy_id = 1;
+        phy.phy_oid = sai_serialize_object_id(_gb_phy_oid);
+
+        gearbox_interface_t intf = {};
+        intf.index = p.m_index;
+        intf.phy_id = phy.phy_id;
+        intf.system_lanes = {300, 301};
+        intf.line_lanes = {304, 305};
+        intf.tx_firs = {{"system_tx_fir_main", "60,60"}, {"line_tx_fir_main", "60,60"}};
+
+        gearbox_port_t gbPort = {};
+        gbPort.index = p.m_index;
+        gbPort.system_speed = 25000;
+        gbPort.system_fec = "none";
+        gbPort.line_speed = 25000;
+        gbPort.line_fec = "none";
+
+        orch->m_gearboxEnabled = true;
+        orch->m_gearboxPhyMap[phy.phy_id] = phy;
+        orch->m_gearboxInterfaceMap[p.m_index] = intf;
+        orch->m_gearboxPortMap[p.m_index] = gbPort;
+        orch->m_gearboxExistingPorts.clear();
+        orch->m_gb_counter_db = make_shared<DBConnector>("GB_COUNTERS_DB", 0);
+        orch->m_gbcounterTable = make_unique<Table>(orch->m_gb_counter_db.get(), COUNTERS_PORT_NAME_MAP);
+        orch->m_gb_asic_db = make_shared<DBConnector>("GB_ASIC_DB", 0);
+        orch->m_gbAsicTable = make_unique<Table>(orch->m_gb_asic_db.get(), "ASIC_STATE");
+        _gb_asic_table = orch->m_gbAsicTable.get();
+
+        return p;
+    }
+
+    // The Gearbox ASIC DB record of a serdes the PHY holds; an empty txFirMain records no tuning
+    void _set_gb_serdes_record(sai_object_id_t serdes, sai_object_id_t gbPort, const string &txFirMain)
+    {
+        const string key = "SAI_OBJECT_TYPE_PORT_SERDES:" + sai_serialize_object_id(serdes);
+        _gb_asic_table->hset(key, "SAI_PORT_SERDES_ATTR_PORT_ID", sai_serialize_object_id(gbPort));
+        if (!txFirMain.empty())
+        {
+            _gb_asic_table->hset(key, "SAI_PORT_SERDES_ATTR_TX_FIR_MAIN", txFirMain);
+        }
+    }
+
     struct PortsOrchTest : public ::testing::Test
     {
         shared_ptr<swss::DBConnector> m_app_db;
@@ -2275,6 +2518,348 @@ namespace portsorch_test
 
         _unhook_sai_port_api();
         cleanupPorts(gPortsOrch);
+    }
+
+    /*
+     * Warm start: the PHY already has the system-side and line-side ports for the
+     * configured lanes. They are reused: no port, connector or serdes is created,
+     * and the serdes they keep are mapped to them for the PHY serdes counters.
+     */
+    TEST_F(PortsOrchTest, GearboxWarmStartReusesExistingPorts)
+    {
+        _hook_gb_sai_api();
+        Port p = _setup_gb_interface(gPortsOrch);
+
+        const sai_object_id_t systemPort = _gb_phy_oid + 1, linePort = _gb_phy_oid + 2;
+        const sai_object_id_t systemSerdes = _gb_phy_oid + 0x201, lineSerdes = _gb_phy_oid + 0x202;
+        _gb_existing_ports[systemPort] = {301, 300};
+        _gb_existing_ports[linePort] = {304, 305};
+        _gb_existing_ports[_gb_phy_oid + 3] = {302, 303};
+        _gb_port_serdes[systemPort] = systemSerdes;
+        _gb_port_serdes[linePort] = lineSerdes;
+        _set_gb_serdes_record(systemSerdes, systemPort, "2:60,60");
+        _set_gb_serdes_record(lineSerdes, linePort, "2:60,60");
+
+        gPortsOrch->m_isWarmRestoreStage = true;
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(p));
+        gPortsOrch->m_isWarmRestoreStage = false;
+
+        ASSERT_EQ(p.m_switch_id, _gb_phy_oid);
+        ASSERT_EQ(p.m_system_side_id, systemPort);
+        ASSERT_EQ(p.m_line_side_id, linePort);
+        ASSERT_EQ(gPortsOrch->m_gearboxPortListLaneMap[p.m_port_id], make_tuple(systemPort, linePort));
+        ASSERT_TRUE(_gb_created_port_lanes.empty());
+        ASSERT_EQ(_gb_create_port_connector_count, 0);
+        ASSERT_TRUE(_sai_create_port_serdes_calls.empty());
+        ASSERT_EQ(_gb_remove_port_serdes_count, 0);
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[systemPort], systemSerdes);
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[linePort], lineSerdes);
+
+        string oid;
+        ASSERT_TRUE(gPortsOrch->m_gbcounterTable->hget("", "Ethernet0_system", oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(systemPort));
+        ASSERT_TRUE(gPortsOrch->m_gbcounterTable->hget("", "Ethernet0_line", oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(linePort));
+        ASSERT_TRUE(gPortsOrch->m_portSerdesIdToPortIdTable->hget("", sai_serialize_object_id(systemSerdes), oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(systemPort));
+        ASSERT_TRUE(gPortsOrch->m_portSerdesIdToPortIdTable->hget("", sai_serialize_object_id(lineSerdes), oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(linePort));
+
+        // The PHY is read once for all of its interfaces, and not kept after the warm restore
+        Port again = p;
+        gPortsOrch->m_isWarmRestoreStage = true;
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(again));
+        ASSERT_EQ(_gb_port_list_get_count, 1);
+        ASSERT_FALSE(gPortsOrch->m_gearboxExistingPorts.empty());
+
+        gPortsOrch->m_gearboxEnabled = false;
+        _unhook_gb_sai_api();
+
+        gPortsOrch->onWarmBootEnd();
+        ASSERT_FALSE(gPortsOrch->m_isWarmRestoreStage);
+        ASSERT_TRUE(gPortsOrch->m_gearboxExistingPorts.empty());
+    }
+
+    /*
+     * Warm start reusing ports where one side has no serdes: that side is left
+     * without one, the other keeps its own.
+     */
+    TEST_F(PortsOrchTest, GearboxWarmStartReusedPortWithoutSerdesGetsNone)
+    {
+        GbSaiApiHook hook;
+        Port p = _setup_gb_interface(gPortsOrch);
+
+        const sai_object_id_t systemPort = _gb_phy_oid + 1, linePort = _gb_phy_oid + 2;
+        const sai_object_id_t systemSerdes = _gb_phy_oid + 0x201;
+        _gb_existing_ports[systemPort] = {300, 301};
+        _gb_existing_ports[linePort] = {304, 305};
+        _gb_port_serdes[systemPort] = systemSerdes;
+        _set_gb_serdes_record(systemSerdes, systemPort, "2:60,60");
+
+        gPortsOrch->m_isWarmRestoreStage = true;
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(p));
+        gPortsOrch->m_isWarmRestoreStage = false;
+
+        ASSERT_EQ(p.m_system_side_id, systemPort);
+        ASSERT_EQ(p.m_line_side_id, linePort);
+        ASSERT_TRUE(_gb_created_port_lanes.empty());
+        ASSERT_EQ(_gb_create_port_connector_count, 0);
+        ASSERT_EQ(_gb_remove_port_serdes_count, 0);
+        ASSERT_TRUE(_sai_create_port_serdes_calls.empty());
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[systemPort], systemSerdes);
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId.count(linePort), 0);
+
+        string oid;
+        ASSERT_TRUE(gPortsOrch->m_portSerdesIdToPortIdTable->hget("", sai_serialize_object_id(systemSerdes), oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(systemPort));
+
+        gPortsOrch->m_gearboxExistingPorts.clear();
+        gPortsOrch->m_gearboxReusedPorts.clear();
+    }
+
+    /*
+     * Warm start reusing ports whose serdes hold no tunings (the PHY refused the
+     * TX FIR at the last start) or other tunings than the configured ones: each
+     * port keeps its serdes as it is.
+     */
+    TEST_F(PortsOrchTest, GearboxWarmStartReusedPortKeepsItsSerdes)
+    {
+        GbSaiApiHook hook;
+        Port p = _setup_gb_interface(gPortsOrch);
+
+        const sai_object_id_t systemPort = _gb_phy_oid + 1, linePort = _gb_phy_oid + 2;
+        const sai_object_id_t systemSerdes = _gb_phy_oid + 0x201, lineSerdes = _gb_phy_oid + 0x202;
+        _gb_existing_ports[systemPort] = {300, 301};
+        _gb_existing_ports[linePort] = {304, 305};
+        _gb_port_serdes[systemPort] = systemSerdes;
+        _gb_port_serdes[linePort] = lineSerdes;
+        _set_gb_serdes_record(systemSerdes, systemPort, "");
+        _set_gb_serdes_record(lineSerdes, linePort, "2:112,112");
+
+        gPortsOrch->m_isWarmRestoreStage = true;
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(p));
+        gPortsOrch->m_isWarmRestoreStage = false;
+
+        ASSERT_TRUE(_gb_created_port_lanes.empty());
+        ASSERT_EQ(_gb_create_port_connector_count, 0);
+        ASSERT_EQ(_gb_remove_port_serdes_count, 0);
+        ASSERT_TRUE(_sai_create_port_serdes_calls.empty());
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[systemPort], systemSerdes);
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[linePort], lineSerdes);
+
+        string oid;
+        ASSERT_TRUE(gPortsOrch->m_portSerdesIdToPortIdTable->hget("", sai_serialize_object_id(systemSerdes), oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(systemPort));
+        ASSERT_TRUE(gPortsOrch->m_portSerdesIdToPortIdTable->hget("", sai_serialize_object_id(lineSerdes), oid));
+        ASSERT_EQ(oid, sai_serialize_object_id(linePort));
+
+        gPortsOrch->m_gearboxExistingPorts.clear();
+        gPortsOrch->m_gearboxReusedPorts.clear();
+    }
+
+    /*
+     * Warm start, but the PHY does not have both ports for the configured lanes
+     * (one side missing, lanes that differ or are ambiguous, or the PHY cannot be read): the ports,
+     * their connector and their serdes are created as on a cold start.
+     */
+    TEST_F(PortsOrchTest, GearboxWarmStartFallsBackToCreate)
+    {
+        const vector<vector<uint32_t>> bothSides = {{300, 301}, {304, 305}};
+
+        for (int variant = 0; variant < 6; variant++)
+        {
+            GbSaiApiHook hook;
+            Port p = _setup_gb_interface(gPortsOrch);
+
+            switch (variant)
+            {
+                case 0: // no ports on the PHY
+                    break;
+                case 1: // system side only
+                    _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+                    break;
+                case 2: // line side covers other lanes
+                    _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+                    _gb_existing_ports[_gb_phy_oid + 2] = {304, 305, 306, 307};
+                    break;
+                case 3: // both exist but the port list cannot be read
+                    _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+                    _gb_existing_ports[_gb_phy_oid + 2] = {304, 305};
+                    _gb_port_list_get_fail = true;
+                    break;
+                case 4: // both exist but their lanes cannot be read
+                    _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+                    _gb_existing_ports[_gb_phy_oid + 2] = {304, 305};
+                    _gb_lane_list_get_fail = true;
+                    break;
+                case 5: // two ports claim the system-side lanes
+                    _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+                    _gb_existing_ports[_gb_phy_oid + 2] = {304, 305};
+                    _gb_existing_ports[_gb_phy_oid + 3] = {301, 300};
+                    break;
+            }
+
+            gPortsOrch->m_isWarmRestoreStage = true;
+            ASSERT_TRUE(gPortsOrch->initGearboxPort(p)) << "variant " << variant;
+            gPortsOrch->m_isWarmRestoreStage = false;
+
+            ASSERT_EQ(_gb_created_port_lanes, bothSides) << "variant " << variant;
+            ASSERT_EQ(_gb_create_port_connector_count, 1) << "variant " << variant;
+            ASSERT_EQ(_sai_create_port_serdes_calls.size(), 2) << "variant " << variant;
+            ASSERT_EQ(p.m_system_side_id, _gb_phy_oid + 0x101) << "variant " << variant;
+            ASSERT_EQ(p.m_line_side_id, _gb_phy_oid + 0x102) << "variant " << variant;
+
+            gPortsOrch->m_gearboxExistingPorts.clear();
+            gPortsOrch->m_gearboxReusedPorts.clear();
+        }
+    }
+
+    /*
+     * Warm restore replay on reused Gearbox ports: admin down, the settings again,
+     * admin up. Settings the PHY already holds do not reach it, and neither does
+     * the admin down ahead of them; a setting that changes is applied with the
+     * ports admin down; an admin down that stays reaches the PHY when the warm
+     * restore ends. After the warm restore the ports still leave out a setting
+     * that is already applied.
+     */
+    TEST_F(PortsOrchTest, GearboxWarmStartReplayKeepsUnchangedSettings)
+    {
+        GbSaiApiHook hook;
+        Port p = _setup_gb_interface(gPortsOrch);
+
+        const sai_object_id_t systemPort = _gb_phy_oid + 1, linePort = _gb_phy_oid + 2;
+        const sai_object_id_t systemSerdes = _gb_phy_oid + 0x300, lineSerdes = _gb_phy_oid + 0x301;
+        _gb_existing_ports[systemPort] = {300, 301};
+        _gb_existing_ports[linePort] = {304, 305};
+        _gb_port_serdes[systemPort] = systemSerdes;
+        _gb_port_serdes[linePort] = lineSerdes;
+        // the line-side tuning the PHY holds is the configured one
+        gPortsOrch->m_gearboxInterfaceMap[p.m_index].tx_firs["line_tx_fir_main"] = "112,112";
+
+        // what the Gearbox ASIC DB holds from before the warm start
+        for (auto gbPort : { systemPort, linePort })
+        {
+            _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT:" + sai_serialize_object_id(gbPort), "SAI_PORT_ATTR_ADMIN_STATE", "true");
+            _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT:" + sai_serialize_object_id(gbPort), "SAI_PORT_ATTR_FEC_MODE", "SAI_PORT_FEC_MODE_RS");
+        }
+        _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT_SERDES:" + sai_serialize_object_id(lineSerdes), "SAI_PORT_SERDES_ATTR_TX_FIR_MAIN", "2:112,112");
+        _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT_SERDES:" + sai_serialize_object_id(lineSerdes), "SAI_PORT_SERDES_ATTR_PORT_ID", sai_serialize_object_id(linePort));
+        _gb_asic_table->hset("SAI_OBJECT_TYPE_PORT_SERDES:" + sai_serialize_object_id(lineSerdes), "NULL", "NULL");
+
+        gPortsOrch->m_isWarmRestoreStage = true;
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(p));
+        gPortsOrch->m_portList[p.m_alias] = p;
+
+        bool down = false, up = true;
+        sai_int32_t fec = SAI_PORT_FEC_MODE_RS;
+        map<sai_attr_id_t, SerdesValue> taps = {{SAI_PORT_SERDES_ATTR_TX_FIR_MAIN, vector<uint32_t>{112, 112}}};
+
+        // only the line side is admin down: the admin up reaches it alone and no admin down stays held
+        const string lineKey = "SAI_OBJECT_TYPE_PORT:" + sai_serialize_object_id(linePort);
+        _gb_asic_table->hset(lineKey, "SAI_PORT_ATTR_ADMIN_STATE", "false");
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &down));
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &up));
+        const vector<tuple<sai_object_id_t, sai_attr_id_t, int32_t>> lineUp = {
+            make_tuple(linePort, SAI_PORT_ATTR_ADMIN_STATE, 1),
+        };
+        ASSERT_EQ(_gb_sets, lineUp);
+        ASSERT_TRUE(gPortsOrch->m_gearboxHeldAdminDown.empty());
+        _gb_sets.clear();
+
+        // nothing changes: nothing reaches the PHY
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &down));
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_FEC_MODE, &fec));
+        ASSERT_TRUE(gPortsOrch->setPortSerdesAttribute(linePort, _gb_phy_oid, taps));
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &up));
+
+        ASSERT_TRUE(_gb_sets.empty());
+        ASSERT_EQ(_gb_remove_port_serdes_count, 0);
+        ASSERT_TRUE(_sai_create_port_serdes_calls.empty());
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[linePort], lineSerdes);
+        ASSERT_TRUE(gPortsOrch->m_gearboxHeldAdminDown.empty());
+
+        // the FEC mode changes: both sides go admin down, take the new mode and come back up
+        fec = SAI_PORT_FEC_MODE_NONE;
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &down));
+        ASSERT_TRUE(_gb_sets.empty());
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_FEC_MODE, &fec));
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &up));
+
+        const vector<tuple<sai_object_id_t, sai_attr_id_t, int32_t>> fecChange = {
+            make_tuple(systemPort, SAI_PORT_ATTR_ADMIN_STATE, 0),
+            make_tuple(linePort, SAI_PORT_ATTR_ADMIN_STATE, 0),
+            make_tuple(systemPort, SAI_PORT_ATTR_FEC_MODE, SAI_PORT_FEC_MODE_NONE),
+            make_tuple(linePort, SAI_PORT_ATTR_FEC_MODE, SAI_PORT_FEC_MODE_NONE),
+            make_tuple(systemPort, SAI_PORT_ATTR_ADMIN_STATE, 1),
+            make_tuple(linePort, SAI_PORT_ATTR_ADMIN_STATE, 1),
+        };
+        ASSERT_EQ(_gb_sets, fecChange);
+        _gb_sets.clear();
+
+        // other tunings than the serdes holds: the serdes stays through the warm restore and nothing reaches the PHY
+        taps = {{SAI_PORT_SERDES_ATTR_TX_FIR_MAIN, vector<uint32_t>{100, 100}}};
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &down));
+        ASSERT_TRUE(gPortsOrch->setPortSerdesAttribute(linePort, _gb_phy_oid, taps));
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &up));
+        ASSERT_TRUE(_gb_sets.empty());
+        ASSERT_EQ(_gb_remove_port_serdes_count, 0);
+        ASSERT_TRUE(_sai_create_port_serdes_calls.empty());
+        ASSERT_EQ(gPortsOrch->m_portIdToSerdesId[linePort], lineSerdes);
+        ASSERT_TRUE(gPortsOrch->m_gearboxHeldAdminDown.empty());
+
+        // admin down with no admin up after it: applied when the warm restore ends
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &down));
+        ASSERT_TRUE(_gb_sets.empty());
+        gPortsOrch->m_portList.erase(p.m_alias);
+        gPortsOrch->onWarmBootEnd();
+
+        const vector<tuple<sai_object_id_t, sai_attr_id_t, int32_t>> adminDown = {
+            make_tuple(systemPort, SAI_PORT_ATTR_ADMIN_STATE, 0),
+            make_tuple(linePort, SAI_PORT_ATTR_ADMIN_STATE, 0),
+        };
+        ASSERT_EQ(_gb_sets, adminDown);
+        _gb_sets.clear();
+
+        // after the warm restore a serdes update replaces the serdes
+        gPortsOrch->m_portList[p.m_alias] = p;
+        ASSERT_TRUE(gPortsOrch->setPortSerdesAttribute(linePort, _gb_phy_oid, taps));
+        gPortsOrch->m_portList.erase(p.m_alias);
+        ASSERT_EQ(_gb_remove_port_serdes_count, 1);
+        ASSERT_EQ(_sai_create_port_serdes_calls.size(), 1);
+        ASSERT_NE(gPortsOrch->m_portIdToSerdesId[linePort], lineSerdes);
+
+        // after the warm restore: a setting already applied still stays away from the PHY, a new one reaches it
+        fec = SAI_PORT_FEC_MODE_NONE;
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_FEC_MODE, &fec));
+        ASSERT_TRUE(_gb_sets.empty());
+        fec = SAI_PORT_FEC_MODE_RS;
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_FEC_MODE, &fec));
+        ASSERT_EQ(_gb_sets.size(), 2);
+        ASSERT_TRUE(gPortsOrch->setGearboxPortsAttr(p, SAI_PORT_ATTR_ADMIN_STATE, &up));
+        ASSERT_EQ(_gb_sets.size(), 4);
+    }
+
+    /*
+     * Outside the warm restore the PHY is not consulted: matching ports on it do not
+     * stop the create.
+     */
+    TEST_F(PortsOrchTest, GearboxColdStartCreatesPorts)
+    {
+        GbSaiApiHook hook;
+        Port p = _setup_gb_interface(gPortsOrch);
+
+        _gb_existing_ports[_gb_phy_oid + 1] = {300, 301};
+        _gb_existing_ports[_gb_phy_oid + 2] = {304, 305};
+
+        ASSERT_FALSE(gPortsOrch->m_isWarmRestoreStage);
+        ASSERT_TRUE(gPortsOrch->initGearboxPort(p));
+
+        ASSERT_EQ(_gb_port_list_get_count, 0);
+        ASSERT_EQ(_gb_created_port_lanes.size(), 2);
+        ASSERT_EQ(_gb_create_port_connector_count, 1);
+        ASSERT_EQ(_sai_create_port_serdes_calls.size(), 2);
+        ASSERT_EQ(p.m_system_side_id, _gb_phy_oid + 0x101);
+        ASSERT_EQ(p.m_line_side_id, _gb_phy_oid + 0x102);
     }
 
     /**

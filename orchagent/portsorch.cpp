@@ -90,6 +90,11 @@ extern bool gMultiAsicVoq;
 #define PORT_SPEED_LIST_DEFAULT_SIZE                     16
 #define PORT_STATE_POLLING_SEC                            5
 #define PORT_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS     1000
+<<<<<<< HEAD
+=======
+#define GB_PORT_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS 10000
+#define GEARBOX_PORT_MAX_LANES                          1024
+>>>>>>> 26f3111b (NOS-19569: [orchagent] Reuse the gearbox PHYs and ports on a warm start (#1484))
 #define PORT_BUFFER_DROP_STAT_POLLING_INTERVAL_MS     60000
 #define PORT_PHY_ATTR_FLEX_COUNTER_POLLING_INTERVAL_MS 10000
 #define QUEUE_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS   10000
@@ -3422,6 +3427,172 @@ void PortsOrch::initPortSupportedFecModes(const std::string& alias, sai_object_i
 }
 
 /*
+ * The gearbox syncd applies every set to the PHY at once, also while orchagent
+ * replays its configuration at a warm start. A set or a serdes whose value the
+ * Gearbox ASIC DB already holds for a reused Gearbox port is left out, so the
+ * replay does not disturb the link.
+ */
+bool PortsOrch::isGearboxAttrApplied(sai_object_type_t objectType, sai_object_id_t oid, const sai_attribute_t &attr)
+{
+    auto meta = sai_metadata_get_attr_metadata(objectType, attr.id);
+    string applied;
+
+    if (meta == nullptr || !m_gbAsicTable)
+    {
+        return false;
+    }
+
+    string wanted = sai_serialize_attr_value(*meta, attr);
+
+    /* A set this orchagent sent may not be in the DB yet */
+    auto sent = m_gearboxSentAttrs.find(make_pair(oid, attr.id));
+    if (objectType == SAI_OBJECT_TYPE_PORT && sent != m_gearboxSentAttrs.end())
+    {
+        return sent->second == wanted;
+    }
+
+    string key = sai_serialize_object_type(objectType) + ":" + sai_serialize_object_id(oid);
+
+    return m_gbAsicTable->hget(key, meta->attridname, applied) && applied == wanted;
+}
+
+/* Remember a set sent to a reused Gearbox port */
+void PortsOrch::noteGearboxPortSet(sai_object_id_t gbPortId, const sai_attribute_t &attr)
+{
+    auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_PORT, attr.id);
+
+    if (meta != nullptr && m_gearboxReusedPorts.find(gbPortId) != m_gearboxReusedPorts.end())
+    {
+        m_gearboxSentAttrs[make_pair(gbPortId, attr.id)] = sai_serialize_attr_value(*meta, attr);
+    }
+}
+
+/*
+ * The replay takes a port admin down ahead of settings it applies again. On a
+ * reused Gearbox port the admin down is held back, and reaches the PHY only
+ * when a setting that follows really changes or the warm restore ends.
+ */
+void PortsOrch::applyHeldGearboxAdminDown(sai_object_id_t portId)
+{
+    if (m_gearboxHeldAdminDown.erase(portId) == 0)
+    {
+        return;
+    }
+
+    auto sides = m_gearboxPortListLaneMap.find(portId);
+    if (sides == m_gearboxPortListLaneMap.end())
+    {
+        return;
+    }
+
+    sai_attribute_t attr;
+    attr.id = SAI_PORT_ATTR_ADMIN_STATE;
+    attr.value.booldata = false;
+
+    for (auto gbPortId : { get<0>(sides->second), get<1>(sides->second) })
+    {
+        sai_status_t status = sai_port_api->set_port_attribute(gbPortId, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("BOX: Failed to set Gearbox port 0x%" PRIx64 " admin down, status:%d", gbPortId, status);
+            continue;
+        }
+        noteGearboxPortSet(gbPortId, attr);
+    }
+}
+
+/*
+ * True when a set on a reused Gearbox port must not reach the PHY.
+ *
+ * A set the Gearbox ASIC DB already holds is left out. After the warm restore
+ * every port update sets the FEC mode again, which would drop the link; the
+ * same check leaves it out. During the restore see skipGearboxWarmReplaySet.
+ */
+bool PortsOrch::skipGearboxPortSet(const Port &port, sai_object_id_t gbPortId, const sai_attribute_t &attr)
+{
+    if (m_gearboxReusedPorts.find(gbPortId) == m_gearboxReusedPorts.end())
+    {
+        return false;
+    }
+
+    bool isSet = isGearboxAttrApplied(SAI_OBJECT_TYPE_PORT, gbPortId, attr);
+
+    if (!m_isWarmRestoreStage)
+    {
+        return isSet;
+    }
+
+    return skipGearboxWarmReplaySet(port, gbPortId, attr, isSet);
+}
+
+/*
+ * The warm restore part of skipGearboxPortSet. Orchagent replays the port
+ * configuration: per port it sets admin down, sets the FEC mode, replaces the
+ * serdes and sets admin up. On the NPU the temporary view absorbs this. The
+ * gearbox syncd has no view, so each set reaches the PHY and drops the link.
+ * The admin down is held back until a setting really changes.
+ */
+bool PortsOrch::skipGearboxWarmReplaySet(const Port &port, sai_object_id_t gbPortId, const sai_attribute_t &attr, bool isSet)
+{
+    if (attr.id == SAI_PORT_ATTR_ADMIN_STATE)
+    {
+        if (!attr.value.booldata)
+        {
+            if (!isSet)
+            {
+                m_gearboxHeldAdminDown.insert(port.m_port_id);
+            }
+            return true;
+        }
+
+        /* The admin up reaches the line side last: the held admin down is void from here on */
+        auto sides = m_gearboxPortListLaneMap.find(port.m_port_id);
+        if (sides != m_gearboxPortListLaneMap.end() && gbPortId == get<1>(sides->second))
+        {
+            m_gearboxHeldAdminDown.erase(port.m_port_id);
+        }
+        return isSet;
+    }
+
+    if (!isSet)
+    {
+        applyHeldGearboxAdminDown(port.m_port_id);
+    }
+
+    return isSet;
+}
+
+/* Record the serdes a reused Gearbox port keeps, as setPortSerdesAttribute records one it creates */
+void PortsOrch::mapGearboxPortSerdes(sai_object_id_t gbPortId, sai_object_id_t serdesId)
+{
+    m_portIdToSerdesId[gbPortId] = serdesId;
+    m_portSerdesIdToPortIdTable->hset("", sai_serialize_object_id(serdesId), sai_serialize_object_id(gbPortId));
+}
+
+/*
+ * A reused Gearbox port keeps the serdes it has, whatever tunings it holds, and
+ * gets none if it has none: replacing a serdes reaches the PHY and drops the link.
+ * gearbox_config tunings that changed take effect on the next cold start.
+ */
+void PortsOrch::keepGearboxPortSerdes(sai_object_id_t gbPortId)
+{
+    sai_attribute_t attr;
+
+    attr.id = SAI_PORT_ATTR_PORT_SERDES_ID;
+    attr.value.oid = SAI_NULL_OBJECT_ID;
+
+    sai_status_t status = sai_port_api->get_port_attribute(gbPortId, 1, &attr);
+    if (status != SAI_STATUS_SUCCESS || attr.value.oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_NOTICE("BOX: Reused Gearbox port 0x%" PRIx64 " has no port serdes object, status:%d", gbPortId, status);
+        return;
+    }
+
+    SWSS_LOG_NOTICE("BOX: Gearbox port 0x%" PRIx64 " keeps port serdes object 0x%" PRIx64, gbPortId, attr.value.oid);
+    mapGearboxPortSerdes(gbPortId, attr.value.oid);
+}
+
+/*
  * If Gearbox is enabled and this is a Gearbox port then set the attributes accordingly.
  */
 bool PortsOrch::setGearboxPortsAttr(const Port &port, sai_port_attr_t id, void *value, bool override_fec)
@@ -3514,18 +3685,36 @@ bool PortsOrch::setGearboxPortAttr(const Port &port, dest_port_type_t port_type,
                     return false;
             }
 
-            status = sai_port_api->set_port_attribute(dest_port_id, &attr);
+            bool skip = skipGearboxPortSet(port, dest_port_id, attr);
+
+            status = skip ? SAI_STATUS_SUCCESS : sai_port_api->set_port_attribute(dest_port_id, &attr);
             if (status == SAI_STATUS_SUCCESS)
             {
+                if (!skip)
+                {
+                    noteGearboxPortSet(dest_port_id, attr);
+                }
+
                 if (id == SAI_PORT_ATTR_SPEED)
                 {
                     string key = "phy:"+to_string(m_gearboxInterfaceMap[port.m_index].phy_id)+":ports:"+to_string(port.m_index);
                     m_gearboxTable->hset(key, speed_attr, to_string(speed));
                     SWSS_LOG_NOTICE("BOX: Updated APPL_DB key:%s %s %d", key.c_str(), speed_attr.c_str(), speed);
                 }
-                else if (id == SAI_PORT_ATTR_FEC_MODE && fec_override_sup && !setPortFecOverride(dest_port_id, override_fec))
+                else if (id == SAI_PORT_ATTR_FEC_MODE && fec_override_sup)
                 {
-                    return false;
+                    sai_attribute_t override_attr;
+                    override_attr.id = SAI_PORT_ATTR_AUTO_NEG_FEC_MODE_OVERRIDE;
+                    override_attr.value.booldata = override_fec;
+
+                    if (!(skip && skipGearboxPortSet(port, dest_port_id, override_attr)))
+                    {
+                        if (!setPortFecOverride(dest_port_id, override_fec))
+                        {
+                            return false;
+                        }
+                        noteGearboxPortSet(dest_port_id, override_attr);
+                    }
                 }
             }
             else
@@ -6618,6 +6807,13 @@ void PortsOrch::onWarmBootEnd()
     SWSS_LOG_ENTER();
 
     m_isWarmRestoreStage = false;
+
+    /* A port that stays admin down gets the admin down held back for it */
+    while (!m_gearboxHeldAdminDown.empty())
+    {
+        applyHeldGearboxAdminDown(*m_gearboxHeldAdminDown.begin());
+    }
+    m_gearboxExistingPorts.clear();
 
     /* Start dynamic state sync up */
     refreshPortStatus();
@@ -10519,6 +10715,7 @@ bool PortsOrch::setPortSerdesAttribute(sai_object_id_t port_id, sai_object_id_t 
     auto flex_counters_orch = gDirectory.get<FlexCounterOrch*>();
 
     port_attr.id = SAI_PORT_ATTR_PORT_SERDES_ID;
+    port_attr.value.oid = SAI_NULL_OBJECT_ID;
     status = sai_port_api->get_port_attribute(port_id, 1, &port_attr);
     if (status != SAI_STATUS_SUCCESS)
     {
@@ -10529,6 +10726,17 @@ bool PortsOrch::setPortSerdesAttribute(sai_object_id_t port_id, sai_object_id_t 
         {
             return false;
         }
+    }
+
+    /* The warm restore replay leaves the serdes of a reused Gearbox port as it is */
+    if (m_isWarmRestoreStage && m_gearboxReusedPorts.find(port_id) != m_gearboxReusedPorts.end())
+    {
+        if (port_attr.value.oid != SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_NOTICE("BOX: Gearbox port 0x%" PRIx64 " keeps port serdes object 0x%" PRIx64, port_id, port_attr.value.oid);
+            mapGearboxPortSerdes(port_id, port_attr.value.oid);
+        }
+        return true;
     }
 
     if (port_attr.value.oid != SAI_NULL_OBJECT_ID)
@@ -10783,7 +10991,86 @@ void PortsOrch::initGearbox()
 
         m_gb_counter_db = shared_ptr<DBConnector>(new DBConnector("GB_COUNTERS_DB", 0));
         m_gbcounterTable = unique_ptr<Table>(new Table(m_gb_counter_db.get(), COUNTERS_PORT_NAME_MAP));
+        m_gb_asic_db = shared_ptr<DBConnector>(new DBConnector("GB_ASIC_DB", 0));
+        m_gbAsicTable = unique_ptr<Table>(new Table(m_gb_asic_db.get(), "ASIC_STATE"));
     }
+}
+
+/*
+ * The gearbox syncd keeps a PHY's ports across a warm start of orchagent.
+ * Return the ports that exist on the PHY, keyed by their lane list.
+ */
+const map<set<int>, sai_object_id_t>& PortsOrch::getExistingGearboxPorts(sai_object_id_t phyOid)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_gearboxExistingPorts.find(phyOid);
+    if (it != m_gearboxExistingPorts.end())
+    {
+        return it->second;
+    }
+
+    auto &existing = m_gearboxExistingPorts[phyOid];
+    sai_attribute_t attr;
+
+    attr.id = SAI_SWITCH_ATTR_PORT_NUMBER;
+    sai_status_t status = sai_switch_api->get_switch_attribute(phyOid, 1, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_NOTICE("BOX: Failed to get the port number of PHY 0x%" PRIx64 ", status:%d", phyOid, status);
+        return existing;
+    }
+
+    if (attr.value.u32 == 0)
+    {
+        return existing;
+    }
+
+    vector<sai_object_id_t> ports(attr.value.u32);
+
+    attr.id = SAI_SWITCH_ATTR_PORT_LIST;
+    attr.value.objlist.count = static_cast<uint32_t>(ports.size());
+    attr.value.objlist.list = ports.data();
+    status = sai_switch_api->get_switch_attribute(phyOid, 1, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_NOTICE("BOX: Failed to get the port list of PHY 0x%" PRIx64 ", status:%d", phyOid, status);
+        return existing;
+    }
+
+    ports.resize(min<size_t>(attr.value.objlist.count, ports.size()));
+
+    set<set<int>> ambiguous;
+
+    for (auto portOid : ports)
+    {
+        vector<uint32_t> lanes(GEARBOX_PORT_MAX_LANES);
+
+        attr.id = SAI_PORT_ATTR_HW_LANE_LIST;
+        attr.value.u32list.count = static_cast<uint32_t>(lanes.size());
+        attr.value.u32list.list = lanes.data();
+        status = sai_port_api->get_port_attribute(portOid, 1, &attr);
+        if (status != SAI_STATUS_SUCCESS || attr.value.u32list.count == 0 || attr.value.u32list.count > lanes.size())
+        {
+            SWSS_LOG_NOTICE("BOX: Failed to get the lanes of port 0x%" PRIx64 " on PHY 0x%" PRIx64 ", status:%d",
+                    portOid, phyOid, status);
+            continue;
+        }
+
+        set<int> key(lanes.begin(), lanes.begin() + attr.value.u32list.count);
+
+        /* Lanes that do not name exactly one port cannot be matched: such a port is created as on a cold start */
+        if (key.size() != attr.value.u32list.count || ambiguous.count(key) || !existing.emplace(key, portOid).second)
+        {
+            SWSS_LOG_NOTICE("BOX: Ambiguous lanes for port 0x%" PRIx64 " on PHY 0x%" PRIx64, portOid, phyOid);
+            existing.erase(key);
+            ambiguous.insert(key);
+        }
+    }
+
+    SWSS_LOG_NOTICE("BOX: PHY 0x%" PRIx64 " has %zu existing ports", phyOid, existing.size());
+
+    return existing;
 }
 
 /*
@@ -10797,9 +11084,9 @@ bool PortsOrch::initGearboxPort(Port &port)
     vector<uint32_t> lanes;
     vector<uint32_t> vals;
     sai_attribute_t attr;
-    sai_object_id_t systemPort;
-    sai_object_id_t linePort;
-    sai_object_id_t connector;
+    sai_object_id_t systemPort = SAI_NULL_OBJECT_ID;
+    sai_object_id_t linePort = SAI_NULL_OBJECT_ID;
+    sai_object_id_t connector = SAI_NULL_OBJECT_ID;
     sai_object_id_t phyOid;
     sai_status_t status;
     string phyOidStr;
@@ -10827,6 +11114,35 @@ bool PortsOrch::initGearboxPort(Port &port)
 
             SWSS_LOG_NOTICE("BOX: Gearbox port %s assigned phyOid 0x%" PRIx64, port.m_alias.c_str(), phyOid);
             port.m_switch_id = phyOid;
+
+            /*
+             * Warm start: reuse the system-side and line-side ports the PHY already has
+             * for the configured lanes. Unless both exist the ports are created.
+             */
+            bool reuse = false;
+
+            if (m_isWarmRestoreStage)
+            {
+                const auto &existing = getExistingGearboxPorts(phyOid);
+                auto systemIt = existing.find(m_gearboxInterfaceMap[port.m_index].system_lanes);
+                auto lineIt = existing.find(m_gearboxInterfaceMap[port.m_index].line_lanes);
+
+                if (systemIt != existing.end() && lineIt != existing.end())
+                {
+                    reuse = true;
+                    systemPort = systemIt->second;
+                    linePort = lineIt->second;
+                    SWSS_LOG_NOTICE("BOX: Reusing Gearbox ports for alias:%s index:%d; system-side:0x%" PRIx64 " line-side:0x%" PRIx64,
+                            port.m_alias.c_str(), port.m_index, systemPort, linePort);
+                }
+                else
+                {
+                    SWSS_LOG_NOTICE("BOX: No existing Gearbox ports match the lanes of alias:%s index:%d (system-side:%s line-side:%s); creating them",
+                            port.m_alias.c_str(), port.m_index,
+                            systemIt != existing.end() ? "found" : "missing",
+                            lineIt != existing.end() ? "found" : "missing");
+                }
+            }
 
             /* Create SYSTEM-SIDE port */
             attrs.clear();
@@ -10889,7 +11205,7 @@ bool PortsOrch::initGearboxPort(Port &port)
                 attrs.push_back(attr);
             }
 
-            status = sai_port_api->create_port(&systemPort, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
+            status = reuse ? SAI_STATUS_SUCCESS : sai_port_api->create_port(&systemPort, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
             if (status != SAI_STATUS_SUCCESS)
             {
                 SWSS_LOG_ERROR("BOX: Failed to create Gearbox system-side port for alias:%s port_id:0x%" PRIx64 " index:%d status:%d",
@@ -10997,7 +11313,7 @@ bool PortsOrch::initGearboxPort(Port &port)
                 attrs.push_back(attr);
             }
 
-            status = sai_port_api->create_port(&linePort, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
+            status = reuse ? SAI_STATUS_SUCCESS : sai_port_api->create_port(&linePort, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
             if (status != SAI_STATUS_SUCCESS)
             {
                 SWSS_LOG_ERROR("BOX: Failed to create Gearbox line-side port for alias:%s port_id:0x%" PRIx64 " index:%d status:%d",
@@ -11021,7 +11337,8 @@ bool PortsOrch::initGearboxPort(Port &port)
             attr.value.oid = linePort;
             attrs.push_back(attr);
 
-            status = sai_port_api->create_port_connector(&connector, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
+            /* Reused ports keep their connector */
+            status = reuse ? SAI_STATUS_SUCCESS : sai_port_api->create_port_connector(&connector, phyOid, static_cast<uint32_t>(attrs.size()), attrs.data());
             if (status != SAI_STATUS_SUCCESS)
             {
                 SWSS_LOG_ERROR("BOX: Failed to connect Gearbox system-side:0x%" PRIx64 " to line-side:0x%" PRIx64 "; status:%d", systemPort, linePort, status);
@@ -11034,6 +11351,11 @@ bool PortsOrch::initGearboxPort(Port &port)
 
             SWSS_LOG_NOTICE("BOX: Connected Gearbox ports; system-side:0x%" PRIx64 " to line-side:0x%" PRIx64, systemPort, linePort);
             m_gearboxPortListLaneMap[port.m_port_id] = make_tuple(systemPort, linePort);
+            if (reuse)
+            {
+                m_gearboxReusedPorts[systemPort] = port.m_port_id;
+                m_gearboxReusedPorts[linePort] = port.m_port_id;
+            }
             port.m_line_side_id = linePort;
             saiOidToAlias[systemPort] = port.m_alias;
             saiOidToAlias[linePort] = port.m_alias;
@@ -11058,7 +11380,11 @@ bool PortsOrch::initGearboxPort(Port &port)
                     serdes_attr.insert(serdes_attr_pair(pair.second, attr_val));
                 }
             }
-            if (serdes_attr.size() != 0)
+            if (reuse)
+            {
+                keepGearboxPortSerdes(systemPort);
+            }
+            else if (serdes_attr.size() != 0)
             {
                 if (setPortSerdesAttribute(systemPort, phyOid, serdes_attr))
                 {
@@ -11078,7 +11404,11 @@ bool PortsOrch::initGearboxPort(Port &port)
                     serdes_attr.insert(serdes_attr_pair(pair.second, attr_val));
                 }
             }
-            if (serdes_attr.size() != 0)
+            if (reuse)
+            {
+                keepGearboxPortSerdes(linePort);
+            }
+            else if (serdes_attr.size() != 0)
             {
                 if (setPortSerdesAttribute(linePort, phyOid, serdes_attr))
                 {

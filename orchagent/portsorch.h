@@ -350,6 +350,8 @@ private:
     FlexCounterManager gb_port_stat_manager;
     shared_ptr<DBConnector> m_gb_counter_db;
     unique_ptr<Table> m_gbcounterTable;
+    shared_ptr<DBConnector> m_gb_asic_db;
+    unique_ptr<Table> m_gbAsicTable;
 
     // Supported speeds on the system side.
     std::map<sai_object_id_t, PortSupportedSpeeds> m_portSupportedSpeeds;
@@ -386,6 +388,14 @@ private:
     map<int, gearbox_lane_t> m_gearboxLaneMap;
     map<int, gearbox_port_t> m_gearboxPortMap;
     map<sai_object_id_t, tuple<sai_object_id_t, sai_object_id_t>> m_gearboxPortListLaneMap;
+    /* Per PHY, the ports found on it at a warm start, by lane list; used during the warm restore only */
+    map<sai_object_id_t, map<set<int>, sai_object_id_t>> m_gearboxExistingPorts;
+    /* Gearbox ports reused at the warm start, to the port they belong to */
+    map<sai_object_id_t, sai_object_id_t> m_gearboxReusedPorts;
+    /* Last value this orchagent set on a reused Gearbox port, per attribute, as the Gearbox ASIC DB holds values */
+    map<pair<sai_object_id_t, sai_attr_id_t>, string> m_gearboxSentAttrs;
+    /* Ports whose Gearbox admin down is held back during the warm restore */
+    set<sai_object_id_t> m_gearboxHeldAdminDown;
 
     unordered_set<string> m_vlanPorts;
     port_config_state_t m_portConfigState = PORT_CONFIG_MISSING;
@@ -597,6 +607,14 @@ private:
     ReturnCode removeSendToIngressHostIf();
     void initGearbox();
     bool initGearboxPort(Port &port);
+    const map<set<int>, sai_object_id_t>& getExistingGearboxPorts(sai_object_id_t phyOid);
+    bool isGearboxAttrApplied(sai_object_type_t objectType, sai_object_id_t oid, const sai_attribute_t &attr);
+    void noteGearboxPortSet(sai_object_id_t gbPortId, const sai_attribute_t &attr);
+    void applyHeldGearboxAdminDown(sai_object_id_t portId);
+    bool skipGearboxPortSet(const Port &port, sai_object_id_t gbPortId, const sai_attribute_t &attr);
+    bool skipGearboxWarmReplaySet(const Port &port, sai_object_id_t gbPortId, const sai_attribute_t &attr, bool isSet);
+    void mapGearboxPortSerdes(sai_object_id_t gbPortId, sai_object_id_t serdesId);
+    void keepGearboxPortSerdes(sai_object_id_t gbPortId);
     bool getPortOperFec(const Port& port, sai_port_fec_mode_t &fec_mode) const;
     void updateDbPortOperFec(Port &port, string fec_str);
     void updatePortErrorStatus(Port &port, sai_port_error_status_t port_oper_eror);

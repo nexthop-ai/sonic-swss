@@ -1,7 +1,11 @@
 #include "ut_helper.h"
+#define private public
+#include "warm_restart.h"
+#undef private
 #include "saihelper.h"
 #include "mock_table.h"
 #include "mock_sai_capability_wrap.h"
+#include "gearboxutils.h"
 
 #include <cstdint>
 #include <memory>
@@ -311,5 +315,95 @@ namespace sai_failure_status_test
             makeAclGroupTypeOverride(SAI_STATUS_FAILURE, {}));
         EXPECT_EQ(SAI_ACL_TABLE_GROUP_TYPE_PARALLEL,
                   querySupportedAclTableGroupType(SAI_NULL_OBJECT_ID));
+    }
+}
+
+extern sai_switch_api_t *sai_switch_api;
+extern std::vector<sai_object_id_t> gGearboxOids;
+
+namespace gearbox_phy_init_test
+{
+    // INIT_SWITCH of every create_switch call, and whether a switch exists to connect to
+    std::vector<bool> _create_switch_init;
+    bool _phy_exists;
+
+    sai_status_t _ut_stub_create_switch(
+        _Out_ sai_object_id_t *switch_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+    {
+        bool init = true;
+        for (uint32_t i = 0; i < attr_count; i++)
+        {
+            if (attr_list[i].id == SAI_SWITCH_ATTR_INIT_SWITCH)
+            {
+                init = attr_list[i].value.booldata;
+            }
+        }
+        _create_switch_init.push_back(init);
+        if (!init && !_phy_exists)
+        {
+            return SAI_STATUS_FAILURE;
+        }
+        *switch_id = 0x2100000000000000;
+        return SAI_STATUS_SUCCESS;
+    }
+
+    struct GearboxPhyInitTest : public ::testing::Test
+    {
+        sai_switch_api_t ut_sai_switch_api = {};
+        sai_switch_api_t *pold_sai_switch_api = nullptr;
+        swss::gearbox_phy_t phy = {};
+
+        void SetUp() override
+        {
+            _create_switch_init.clear();
+            _phy_exists = false;
+            gGearboxOids.clear();
+            ut_sai_switch_api.create_switch = _ut_stub_create_switch;
+            pold_sai_switch_api = sai_switch_api;
+            sai_switch_api = &ut_sai_switch_api;
+            phy.phy_id = 1;
+            phy.hwinfo = "mdio0_0_0/1";
+            phy.access = "mdio";
+        }
+
+        void TearDown() override
+        {
+            sai_switch_api = pold_sai_switch_api;
+            swss::WarmStart::getInstance().m_enabled = false;
+            gGearboxOids.clear();
+        }
+    };
+
+    TEST_F(GearboxPhyInitTest, ColdStartCreatesPhy)
+    {
+        _phy_exists = true;
+
+        ASSERT_EQ(initSaiPhyApi(&phy), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(_create_switch_init, std::vector<bool>({true}));
+        ASSERT_EQ(phy.phy_oid, "oid:0x2100000000000000");
+        ASSERT_EQ(gGearboxOids.size(), 1);
+    }
+
+    TEST_F(GearboxPhyInitTest, WarmStartConnectsToExistingPhy)
+    {
+        swss::WarmStart::getInstance().m_enabled = true;
+        _phy_exists = true;
+
+        ASSERT_EQ(initSaiPhyApi(&phy), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(_create_switch_init, std::vector<bool>({false}));
+        ASSERT_EQ(phy.phy_oid, "oid:0x2100000000000000");
+        ASSERT_EQ(gGearboxOids.size(), 1);
+    }
+
+    TEST_F(GearboxPhyInitTest, WarmStartCreatesMissingPhy)
+    {
+        swss::WarmStart::getInstance().m_enabled = true;
+
+        ASSERT_EQ(initSaiPhyApi(&phy), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(_create_switch_init, std::vector<bool>({false, true}));
+        ASSERT_EQ(phy.phy_oid, "oid:0x2100000000000000");
+        ASSERT_EQ(gGearboxOids.size(), 1);
     }
 }

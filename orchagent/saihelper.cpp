@@ -24,6 +24,7 @@ extern "C" {
 #include "orch.h"
 #include "dbconnector.h"
 #include "table.h"
+#include "warm_restart.h"
 
 using namespace std;
 using namespace swss;
@@ -541,6 +542,7 @@ sai_status_t initSaiPhyApi(swss::gearbox_phy_t *phy)
 
     SWSS_LOG_ENTER();
 
+    /* Must be first Attribute */
     attr.id = SAI_SWITCH_ATTR_INIT_SWITCH;
     attr.value.booldata = true;
     attrs.push_back(attr);
@@ -610,14 +612,46 @@ sai_status_t initSaiPhyApi(swss::gearbox_phy_t *phy)
     attr.value.u64 = phy->context_id;
     attrs.push_back(attr);
 
-    status = sai_switch_api->create_switch(&phyOid, (uint32_t)attrs.size(), attrs.data());
+    /*
+     * The gearbox syncd keeps the PHY across a warm start of orchagent: connect
+     * to the existing PHY switch, creating it a second time fails. Create it
+     * when there is none to connect to.
+     */
+    bool connected = false;
+
+    if (WarmStart::isWarmStart())
+    {
+        attrs[0].value.booldata = false;
+
+        status = sai_switch_api->create_switch(&phyOid, (uint32_t)attrs.size(), attrs.data());
+
+        connected = (status == SAI_STATUS_SUCCESS);
+
+        if (connected)
+        {
+            SWSS_LOG_NOTICE("BOX: Connected to existing PHY:%d Oid:0x%" PRIx64, phy->phy_id, phyOid);
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("BOX: No existing PHY:%d to connect to at warm start, rtn:%d; creating it", phy->phy_id, status);
+            attrs[0].value.booldata = true;
+        }
+    }
+
+    if (!connected)
+    {
+        status = sai_switch_api->create_switch(&phyOid, (uint32_t)attrs.size(), attrs.data());
+    }
 
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("BOX: Failed to create PHY:%d rtn:%d", phy->phy_id, status);
         return status;
     }
-    SWSS_LOG_NOTICE("BOX: Created PHY:%d Oid:0x%" PRIx64, phy->phy_id, phyOid);
+    if (!connected)
+    {
+        SWSS_LOG_NOTICE("BOX: Created PHY:%d Oid:0x%" PRIx64, phy->phy_id, phyOid);
+    }
 
     phy->phy_oid = sai_serialize_object_id(phyOid);
 
