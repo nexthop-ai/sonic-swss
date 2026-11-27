@@ -168,6 +168,7 @@ void PfcWdSwOrch<DropHandler, ForwardHandler>::enableBigRedSwitchMode()
         if (entry.second.handler != nullptr)
         {
             entry.second.handler->commitCounters();
+            this->interruptStorm(entry.second.portAlias, entry.second.index);
             entry.second.handler = nullptr;
         }
     }
@@ -392,6 +393,7 @@ void PfcWdSwOrch<DropHandler, ForwardHandler>::unregisterFromWdDb(const Port& po
         if (registered && entry->second.handler != nullptr)
         {
             entry->second.handler->commitCounters();
+            this->interruptStorm(entry->second.portAlias, entry->second.index);
         }
 
         m_entryMap.erase(queueId);
@@ -880,9 +882,10 @@ bool PfcWdSwOrch<DropHandler, ForwardHandler>::startWdActionOnQueueImpl(const st
     {
         if (entry->second.handler != nullptr)
         {
-            report_pfc_restored(entry->first, entry->second.portId, entry->second.index, entry->second.portAlias);
-
+            // The restore record reads the committed counters.
             entry->second.handler->commitCounters();
+            this->report_pfc_restored(entry->first, entry->second.portId,
+                                     entry->second.index, entry->second.portAlias);
             entry->second.handler = nullptr;
 
             // A storm that starts and clears inside one batch must not be
